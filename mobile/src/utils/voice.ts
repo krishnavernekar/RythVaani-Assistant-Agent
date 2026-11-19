@@ -4,7 +4,7 @@
  * Called by every "వినండి / Listen" button on all screens.
  */
 import * as Speech from 'expo-speech';
-import { stopIndicVoice } from '../services/sarvamVoiceService';
+import { stopAllAudio } from '../services/audioManager';
 
 export type TtsLanguage = 'te-IN' | 'en-IN' | 'hi-IN';
 
@@ -31,7 +31,8 @@ export function speak(
   } = options;
 
   // Stop any currently playing speech first (system TTS or Sarvam audio).
-  stopSpeaking();
+  // Also invalidates in-flight Sarvam synthesis started by an earlier tap.
+  stopAllAudio();
 
   Speech.speak(text, {
     language,
@@ -50,8 +51,7 @@ export function speak(
  * languages. Also wired to `NavigationContainer.onStateChange` globally.
  */
 export function stopSpeaking(): void {
-  stopIndicVoice();
-  Speech.stop().catch(() => {});
+  stopAllAudio();
 }
 
 /**

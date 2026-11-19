@@ -114,11 +114,20 @@ export async function testAiConnection(): Promise<{ connected: boolean; error?: 
       body: JSON.stringify({
         model: OPENROUTER_MODEL,
         messages: [{ role: 'user', content: 'Reply with the single word OK.' }],
-        max_tokens: 8,
+        temperature: 0.2,
+        max_tokens: 16,
       }),
     });
-    if (res.ok) return { connected: true };
-    return { connected: false, error: describeHttpError(res.status, await readError(res)) };
+    if (!res.ok) {
+      return { connected: false, error: describeHttpError(res.status, await readError(res)) };
+    }
+    // A 200 with no message content means real advisory requests will fail too.
+    const data = await res.json().catch(() => null);
+    const content = data?.choices?.[0]?.message?.content;
+    if (typeof content === 'string' && content.trim().length > 0) {
+      return { connected: true };
+    }
+    return { connected: false, error: 'Provider returned an empty answer — check the model in .env' };
   } catch (e: any) {
     return { connected: false, error: `Network error: ${e?.message || String(e)}` };
   }

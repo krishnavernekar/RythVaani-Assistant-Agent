@@ -10,7 +10,12 @@
  */
 import { File, Paths } from 'expo-file-system';
 import { fetch as expoFetch } from 'expo/fetch';
-import { createAudioPlayer } from 'expo-audio';
+import {
+  beginAudioRequest,
+  createGuardedPlayer,
+  isAudioRequestCurrent,
+  stopAllAudio,
+} from './audioManager';
 
 const SARVAM_BASE = 'https://api.sarvam.ai';
 
@@ -176,42 +181,51 @@ export async function synthesizeSpeech(
 /*  One-call playback helper: Sarvam Bulbul → expo-speech fallback     */
 /* ──────────────────────────────────────────────────────────────────── */
 
-let currentPlayer: ReturnType<typeof createAudioPlayer> | null = null;
-
 /**
  * Stops any Sarvam Bulbul playback immediately.
- * Used by the global navigation guard so two audio bulletins never overlap.
+ * Delegates to the shared guard so expo-speech is stopped at the same time.
  */
 export function stopIndicVoice(): void {
-  if (!currentPlayer) return;
-  try {
-    currentPlayer.pause();
-    currentPlayer.release();
-  } catch (e) {
-    console.warn('[Sarvam TTS] stop failed:', e);
-  }
-  currentPlayer = null;
+  stopAllAudio();
 }
 
 /**
  * Plays the advisory text with natural Bulbul voice when the Sarvam key is
  * configured; otherwise / on failure, runs the provided fallback (expo-speech).
+ *
+ * The generation token is taken BEFORE the network synthesis and checked again
+ * afterwards, so tapping another Listen button or navigating while the audio
+ * is being generated can no longer leave stale audio playing.
  */
 export async function playIndicVoice(
   text: string,
   lang: SarvamLang,
   fallbackSpeak: () => void,
 ): Promise<void> {
+  // Stop whatever is playing right now and invalidate older pending requests.
+  const token = beginAudioRequest();
+
   const uri = await synthesizeSpeech(text, lang);
+
+  if (!isAudioRequestCurrent(token)) {
+    console.log('[Sarvam TTS] playback cancelled by a newer action');
+    return;
+  }
+
   if (uri) {
-    try {
-      stopIndicVoice();
-      currentPlayer = createAudioPlayer({ uri });
-      currentPlayer.play();
-      return;
-    } catch (e) {
-      console.error('[Sarvam TTS] playback failed:', e);
+    const player = createGuardedPlayer(uri, token);
+    if (player) {
+      try {
+        player.play();
+        return;
+      } catch (e) {
+        console.error('[Sarvam TTS] playback failed:', e);
+        stopAllAudio();
+      }
     }
   }
+
+  // Never run the fallback if the user moved on while we were synthesizing.
+  if (!isAudioRequestCurrent(token)) return;
   fallbackSpeak();
 }

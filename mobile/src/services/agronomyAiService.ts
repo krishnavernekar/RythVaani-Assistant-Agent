@@ -36,6 +36,8 @@ export interface AiResponse {
   weather_warning_te: string;
   /** Which engine produced this answer — surfaced on the UI card */
   source?: string;
+  /** Set when the cloud provider failed and the offline KB answered instead. */
+  failureReason?: string;
 }
 
 /* ────────────────────────────── Multi-Provider AI ─────────────────────── */
@@ -116,7 +118,8 @@ RULES:
 - NEVER invent chemical pesticide names, dosages, or mixing ratios.
 - STRICTLY BLOCK these banned/restricted CIB&RC chemicals: ${BANNED_PESTICIDES.join(', ')}.
   If the farmer asks about them, refuse and give an approved alternative.
-- Transcribe the farmer's audio into Telugu (transcript_te) and translate to English (transcript_en).
+- The farmer's speech is already transcribed for you in the FARMER QUESTION block. Fill
+  transcript_te and transcript_en from that text; never claim to have listened to audio.
 - If live weather context is provided and a foliar spray is recommended while rain probability
   exceeds 50% or wind exceeds 18 km/h, put an urgent postponement instruction in
   weather_warning_en / weather_warning_te. Otherwise leave those fields as empty strings "".
@@ -333,11 +336,19 @@ function matchOfflineAdvisory(query: string): AiResponse {
 
 /* ──────────────────────── Response parsing ─────────────────────────── */
 
-const safeParseJSON = (text: string): AiResponse => {
+const safeParseJSON = (text: string): AiResponse | null => {
   try {
-    const match = text.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(match ? match[0] : text);
-    return {
+    // Some models still wrap JSON in markdown fences even when told not to.
+    const cleaned = text
+      .replace(/^\s*```(?:json)?\s*/i, '')
+      .replace(/```\s*$/, '')
+      .trim();
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    const candidate = start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned;
+    const parsed = JSON.parse(candidate);
+
+    const response: AiResponse = {
       transcript_en: String(parsed.transcript_en ?? ''),
       transcript_te: String(parsed.transcript_te ?? ''),
       diagnosis_title_en: String(parsed.diagnosis_title_en ?? ''),
@@ -349,9 +360,24 @@ const safeParseJSON = (text: string): AiResponse => {
       weather_warning_en: String(parsed.weather_warning_en ?? ''),
       weather_warning_te: String(parsed.weather_warning_te ?? ''),
     };
+
+    // An empty object is not an advisory — let the caller fall back instead of
+    // rendering a blank card and pretending the LLM answered.
+    const hasAnswer = [
+      response.advisory_en,
+      response.advisory_te,
+      response.diagnosis_title_en,
+      response.diagnosis_title_te,
+    ].some((value) => value.trim().length > 0);
+
+    if (!hasAnswer) {
+      console.warn('[AI] Provider returned JSON with no advisory content');
+      return null;
+    }
+    return response;
   } catch (e) {
     console.error('[AI] JSON parse failed:', e, text.slice(0, 200));
-    return matchOfflineAdvisory('');
+    return null;
   }
 };
 
@@ -427,7 +453,11 @@ function toChatMessages(parts: GeminiPart[]): ChatMessage[] {
 
   for (const part of parts) {
     if ('text' in part) {
-      if (part.text.trim()) content.push({ type: 'text', text: part.text });
+      // The same prompt is also sent as the system role — don't duplicate it.
+      const text = part.text.startsWith(SYSTEM_PROMPT)
+        ? part.text.slice(SYSTEM_PROMPT.length).trim()
+        : part.text;
+      if (text.trim()) content.push({ type: 'text', text });
       continue;
     }
     if (part.inlineData.mimeType.startsWith('image/')) {
@@ -449,13 +479,39 @@ function toChatMessages(parts: GeminiPart[]): ChatMessage[] {
   ];
 }
 
+/** Human-readable reason for the most recent provider failure (diagnostics + UI). */
+let lastProviderError: string | null = null;
+
 function extractChatText(data: any): string {
-  const raw = data?.choices?.[0]?.message?.content;
-  if (typeof raw === 'string') return raw.trim();
-  if (Array.isArray(raw)) {
-    return raw.map((p: any) => (typeof p === 'string' ? p : p?.text ?? '')).join('').trim();
+  const message = data?.choices?.[0]?.message ?? {};
+  const parts: string[] = [];
+
+  const raw = message.content;
+  if (typeof raw === 'string') {
+    parts.push(raw);
+  } else if (Array.isArray(raw)) {
+    for (const p of raw) {
+      if (typeof p === 'string') parts.push(p);
+      else if (typeof p?.text === 'string') parts.push(p.text);
+    }
   }
-  return '';
+
+  // Reasoning models sometimes put the whole answer in reasoning_details while
+  // leaving `content` empty. Accept it as a last resort.
+  if (parts.join('').trim().length === 0) {
+    if (typeof message.reasoning === 'string') parts.push(message.reasoning);
+    if (Array.isArray(message.reasoning_details)) {
+      for (const detail of message.reasoning_details) {
+        if (typeof detail?.text === 'string') parts.push(detail.text);
+      }
+    }
+  }
+
+  if (parts.join('').trim().length === 0 && typeof message.refusal === 'string') {
+    lastProviderError = `Model refused the request: ${message.refusal}`.slice(0, 300);
+  }
+
+  return parts.join('').trim();
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -470,7 +526,10 @@ async function callOpenAICompatible(
   config: OpenAICompatibleConfig,
   parts: GeminiPart[],
 ): Promise<AiResponse | null> {
-  if (!config.apiKey || !config.baseUrl) return null;
+  if (!config.apiKey || !config.baseUrl) {
+    lastProviderError = `${config.label} is not configured in .env`;
+    return null;
+  }
 
   const models = config.models.filter(Boolean).filter((m, i, a) => a.indexOf(m) === i);
   const maxAttempts = 3;
@@ -487,11 +546,13 @@ async function callOpenAICompatible(
             Authorization: `Bearer ${config.apiKey}`,
             ...config.extraHeaders,
           },
+          // Keep the body to universally supported parameters. `response_format`
+          // made `openrouter/auto` pick (and then reject) models that ignore it.
           body: JSON.stringify({
             model,
             messages,
             temperature: 0.2,
-            response_format: { type: 'json_object' },
+            max_tokens: 1600,
           }),
         });
 
@@ -499,11 +560,19 @@ async function callOpenAICompatible(
           const data = await res.json();
           const text = extractChatText(data);
           if (!text) {
+            lastProviderError = `${config.label} (${model}) returned an empty response`;
             console.error(`[${config.label}] Empty response for ${model}`);
-            return null;
+            break; // try the next model instead of giving up
           }
+          const parsed = safeParseJSON(text);
+          if (!parsed) {
+            lastProviderError = `${config.label} (${model}) returned an unreadable advisory`;
+            console.error(`[${config.label}] Unusable JSON for ${model}:`, text.slice(0, 200));
+            break; // try the next model
+          }
+          lastProviderError = null;
           console.log(`[${config.label}] answered with ${data?.model || model}`);
-          return safeParseJSON(text);
+          return parsed;
         }
 
         const errorBody = await res.text().catch(() => '');
@@ -511,12 +580,14 @@ async function callOpenAICompatible(
           res.status === 404 ||
           /model .*(not found|no longer available|unavailable|does not exist)/i.test(errorBody);
 
+        lastProviderError = `${config.label} HTTP ${res.status} (${model}): ${errorBody.slice(0, 160)}`;
         console.error(
           `[${config.label}] HTTP ${res.status} · ${model} (attempt ${attempt}/${maxAttempts}):`,
           errorBody.slice(0, 300),
         );
 
         if (isModelGone) break; // try the next model in the list
+        if (res.status === 400) break; // unsupported parameter/model option → next model
         if (res.status === 401 || res.status === 403) return null; // bad key — stop
         if (res.status === 402) {
           console.error(`[${config.label}] Out of credits for ${model}`);
@@ -535,11 +606,11 @@ async function callOpenAICompatible(
             e.message.includes('Network request failed') ||
             e.message.includes('fetch failed'));
         if (isConnectionError) {
-          console.warn(
-            `[${config.label}] Server unreachable at ${config.baseUrl} — check if FreeLLMAPI is running`,
-          );
+          lastProviderError = `${config.label} server unreachable at ${config.baseUrl}`;
+          console.warn(`[${config.label}] Server unreachable at ${config.baseUrl}`);
           break; // Don't retry connection errors — server is down
         }
+        lastProviderError = `${config.label} request failed: ${e instanceof Error ? e.message : String(e)}`;
         console.error(
           `[${config.label}] Request failed for ${model} (attempt ${attempt}/${maxAttempts}):`,
           e,
@@ -690,8 +761,12 @@ interface ProviderCallResult {
 
 async function callAIProvider(parts: GeminiPart[]): Promise<ProviderCallResult | null> {
   const provider = AI_PROVIDER;
+  lastProviderError = null;
 
-  if (provider === 'offline') return null;
+  if (provider === 'offline') {
+    lastProviderError = 'AI provider is set to offline in .env';
+    return null;
+  }
 
   if (provider === 'gemini') {
     const response = await callGemini(parts);
@@ -768,8 +843,9 @@ export async function analyzeVoiceQuery(input: VoiceQueryInput): Promise<AiRespo
   let sentTe = transcriptTe.trim();
   let sentEn = transcriptEn.trim();
 
-  // 1) Native Telugu STT through Sarvam when we have a recording
-  if (audioUri) {
+  // 1) Native Telugu STT through Sarvam only when the screen has not already
+  //    transcribed the clip (avoids a duplicate ~2s request per question).
+  if (audioUri && !sentTe && !sentEn) {
     const telugu = await transcribeAudio(audioUri, language);
     if (telugu) {
       sentTe = telugu;
@@ -777,8 +853,16 @@ export async function analyzeVoiceQuery(input: VoiceQueryInput): Promise<AiRespo
     }
   }
 
-  // 2) Diagnose + advise via the configured provider
-  const parts: GeminiPart[] = [{ text: `${SYSTEM_PROMPT}\n${weatherContext(weather)}` }];
+  // 2) Diagnose + advise via the configured provider.
+  //    toChatMessages() adds SYSTEM_PROMPT as the system role, so strip it from
+  //    the text part for OpenAI-compatible providers (kept here for Gemini).
+  const parts: GeminiPart[] = [
+    {
+      text:
+        `${SYSTEM_PROMPT}\n${weatherContext(weather)}\n` +
+        'Use the transcript below as the farmer question. Return the advisory JSON now.',
+    },
+  ];
 
   if (audioUri && source !== 'Sarvam Saaras STT' && AI_PROVIDER === 'gemini') {
     // No Sarvam path: only Gemini can transcribe audio inline
@@ -804,8 +888,10 @@ export async function analyzeVoiceQuery(input: VoiceQueryInput): Promise<AiRespo
 
   const aiResult = await callAIProvider(parts);
   let response = aiResult?.response ?? null;
+  let failureReason = lastProviderError ?? undefined;
 
   if (aiResult && response) {
+    failureReason = undefined;
     source =
       source === 'Sarvam Saaras STT'
         ? `${aiResult.source} + Sarvam Saaras STT`
@@ -817,18 +903,26 @@ export async function analyzeVoiceQuery(input: VoiceQueryInput): Promise<AiRespo
 
   // 3) Guardrails: banned-chemical filter → offline KB; also offline when no key
   if (!response || containsBannedPesticide(response)) {
-    if (response) console.warn('[AI] Banned pesticide blocked — falling back to ANGRAU KB');
+    if (response) {
+      console.warn('[AI] Banned pesticide blocked — falling back to ANGRAU KB');
+      failureReason = 'Banned chemical blocked by the CIB&RC safety filter.';
+    } else if (failureReason) {
+      console.warn('[AI] Cloud provider failed — using ANGRAU KB:', failureReason);
+    }
     response = matchOfflineAdvisory(`${sentEn} ${sentTe}`);
     response.transcript_en = response.transcript_en.trim() || sentEn;
     response.transcript_te = response.transcript_te.trim() || sentTe;
-    if (aiResult) {
+    if (aiResult && !failureReason) {
       source = `${aiResult.source} → ANGRAU offline KB (banned-chemical filter)`;
+    } else {
+      source = 'Off-line ANGRAU KB (AI unavailable)';
     }
   }
 
   // 4) Weather-spray interlock (Rule 1.4)
   response = interlockWeatherWarning(response, weather);
   response.source = source;
+  response.failureReason = failureReason;
   return response;
 }
 

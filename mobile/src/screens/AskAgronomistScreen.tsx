@@ -57,6 +57,7 @@ const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [transcriptEn, setTranscriptEn] = useState('');
   const [transcriptTe, setTranscriptTe] = useState('');
   const [advisory, setAdvisory] = useState<AiResponse | null>(null);
+  const [askError, setAskError] = useState<string | null>(null);
 
 useEffect(() => {
   return () => {
@@ -77,6 +78,10 @@ useEffect(() => {
 
   const startRecording = async () => {
   try {
+    // Never let an older advisory keep talking into the microphone.
+    stopSpeaking();
+    setAskError(null);
+
     const perm = await requestRecordingPermissionsAsync();
 
     if (!perm.granted) {
@@ -182,6 +187,8 @@ useEffect(() => {
     if (!hasQuery) return;
     setLoading(true);
     setAdvisory(null);
+    setAskError(null);
+    stopSpeaking();
     try {
       const weather = await fetchWeather();
       const result = await analyzeVoiceQuery({
@@ -191,10 +198,17 @@ useEffect(() => {
         language: sarvamLang,
         weather,
       });
-      // Real dual-script output from Sarvam STT / Gemini
-      setTranscriptEn(result.transcript_en);
-      setTranscriptTe(result.transcript_te);
+      // Real dual-script output from Sarvam STT / the configured AI provider
+      setTranscriptEn(result.transcript_en || transcriptEn);
+      setTranscriptTe(result.transcript_te || transcriptTe);
       setAdvisory(result);
+      if (result.failureReason) {
+        setAskError(
+          isTe
+            ? `AI స్పందించలేదు — ఆఫ్‍లైన్ ANGRAU సలహా చూపబడుతోంది. కారణం: ${result.failureReason}`
+            : `AI could not answer — showing the offline ANGRAU advisory. Reason: ${result.failureReason}`,
+        );
+      }
       incrementQuestions();
       addQuestion({
         questionText: transcriptEn.trim() || result.diagnosis_title_en,
@@ -205,6 +219,11 @@ useEffect(() => {
       });
     } catch (err) {
       console.error('Ask AI pipeline failed:', err);
+      setAskError(
+        isTe
+          ? 'AI సలహా పొందలేకపోయాము. దయచేసి ఇంటర్నెట్ తనిఖీ చేసి మళ్ళీ ప్రయత్నించండి.'
+          : 'Could not get an AI answer. Check your connection and try again.',
+      );
     } finally {
       setLoading(false);
     }
@@ -321,6 +340,12 @@ useEffect(() => {
           </View>
         </View>
 
+        {askError && (
+          <View style={styles.errorCard}>
+            <Text style={styles.errorText}>⚠️ {askError}</Text>
+          </View>
+        )}
+
         {/* AI Advisory Output Card */}
         {advisory && (
           <View style={styles.advisoryCard}>
@@ -402,6 +427,8 @@ const styles = StyleSheet.create({
   saveBtn: { flex: 1, backgroundColor: '#F1F5F9', padding: spacing.sm, borderRadius: 10, alignItems: 'center' },
   footerBtnText: { fontSize: 12, fontWeight: '800', color: Colors.primary },
   sourceChip: { alignSelf: 'flex-start', backgroundColor: '#E8F5E9', color: Colors.primary, fontSize: 10, fontWeight: '700', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, marginBottom: 8, overflow: 'hidden' },
+  errorCard: { backgroundColor: Colors.alert, borderRadius: 14, padding: spacing.md, borderLeftWidth: 4, borderLeftColor: Colors.alertText },
+  errorText: { fontSize: 12, fontWeight: '700', color: Colors.alertText, lineHeight: 18 },
   weatherWarning: { backgroundColor: Colors.warning, borderRadius: 14, padding: spacing.md, marginTop: spacing.md, borderLeftWidth: 4, borderLeftColor: Colors.warningText },
   weatherWarnText: { fontSize: 12, fontWeight: '700', color: '#78350F', lineHeight: 19 },
 });

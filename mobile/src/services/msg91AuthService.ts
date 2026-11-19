@@ -2,8 +2,12 @@
  * msg91AuthService — Real MSG91 v5 OTP Authentication
  * ----------------------------------------------------
  * Supports both SMS OTP and Voice Call OTP for Indian farmers.
- * Falls back to Dev Sandbox (OTP = 123456) when EXPO_PUBLIC_MSG91_* keys
+ * Falls back to Dev Sandbox (OTP = 1234) when EXPO_PUBLIC_MSG91_* keys
  * are absent so development never blocks.
+ *
+ * MSG91 v5 requires `mobile`, `template_id`, `otp_length` and `otp_expiry` as
+ * QUERY parameters on POST /api/v5/otp. Putting them in the JSON body makes
+ * MSG91 ignore them and silently send nothing.
  *
  * Never stores or returns Aadhaar / OTP / bank account numbers inside the
  * app — the phone number is the only PII collected at login.
@@ -46,22 +50,23 @@ const getTemplateId = (): string | null => {
 export const isLiveMsg91Configured = (): boolean =>
   Boolean(getAuthKey() && getTemplateId());
 
+/** The app consistently uses a 4-digit OTP (matches the UI input length). */
+export const OTP_LENGTH = 4;
+export const SANDBOX_OTP = '1234';
+
 /* ──────────────────────────── Mobile number validation ─────────────────── */
 
-/**
- * Strips spaces, dashes and leading '+91' / '91' then validates a 10-digit
- * Indian mobile number matching /^[6-9]\d{9}$/.
- */
-export const isValidIndianMobile = (phone: string): boolean => {
-  const cleaned = phone.replace(/[\s\-+]/g, '');
-  return /^[6-9]\d{9}$/.test(cleaned);
+/** Strips separators and any leading country code, then validates 10 digits. */
+export const cleanPhone = (phone: string): string => {
+  const digits = phone.replace(/[\s\-+]/g, '');
+  return digits.startsWith('91') && digits.length === 12 ? digits.slice(2) : digits;
 };
 
 /**
- * Returns the phone in E.164-style 10-digit form (no +91 prefix).
+ * Validates a 10-digit Indian mobile number matching /^[6-9]\d{9}$/.
  */
-export const cleanPhone = (phone: string): string =>
-  phone.replace(/[\s\-+]/g, '');
+export const isValidIndianMobile = (phone: string): boolean =>
+  /^[6-9]\d{9}$/.test(cleanPhone(phone));
 
 /* ──────────────────────────── Send OTP ─────────────────────────────────── */
 
@@ -87,36 +92,36 @@ export const sendMsg91Otp = async (
     };
   }
 
-  const authKey = getAuthKey();
-  const templateId = getTemplateId();
-
   // Sandbox fallback when keys are not configured.
-  if (!authKey || !templateId) {
-    console.log('[MSG91] No live keys configured — using Dev Sandbox OTP 123456');
+  if (!isLiveMsg91Configured()) {
+    console.log(`[MSG91] No live keys configured — using Dev Sandbox OTP ${SANDBOX_OTP}`);
     return {
       success: true,
       isLiveMsg91: false,
-      messageEn: `Sandbox mode — OTP: 123456 (Dev only. Set EXPO_PUBLIC_MSG91_AUTH_KEY in .env to enable live MSG91 SMS/Voice OTP.)`,
-      messageTe: `సాండ్‌బాక్స్ మోడ్ — OTP: 123456 (కేవలం డెవ్. లైవ్ MSG91 SMS/వాయ్స్ OTP సక్రమీకరించడం కోసం .env లో EXPO_PUBLIC_MSG91_AUTH_KEY జోడించండి.)`,
+      messageEn: `Sandbox mode — OTP: ${SANDBOX_OTP} (Dev only. Set EXPO_PUBLIC_MSG91_AUTH_KEY in .env to enable live MSG91 SMS/Voice OTP.)`,
+      messageTe: `సాండ్‌బాక్స్ మోడ్ — OTP: ${SANDBOX_OTP} (కేవలం డెవ్. లైవ్ MSG91 SMS/వాయ్స్ OTP సక్రమీకరించడం కోసం .env లో EXPO_PUBLIC_MSG91_AUTH_KEY జోడించండి.)`,
     };
   }
 
+  const authKey = getAuthKey() as string;
+  const templateId = getTemplateId() as string;
+
   try {
-    const body = JSON.stringify({
+    // MSG91 v5 reads these from the query string, NOT the JSON body.
+    const params = new URLSearchParams({
+      authkey: authKey,
       mobile: `91${cleaned}`,
-      otp_length: 4,
-      otp_expiry: 300, // 5 minutes
       template_id: templateId,
+      otp_length: String(OTP_LENGTH),
+      otp_expiry: '5', // MSG91 expects MINUTES, not seconds
     });
 
-    const res = await fetch(`${MSG91_BASE_URL}?authkey=${encodeURIComponent(authKey)}`, {
+    const res = await fetch(`${MSG91_BASE_URL}?${params.toString()}`, {
       method: 'POST',
       headers: {
-        'authkey': authKey,
-        'Content-Type': 'application/json',
-        'accept': 'application/json',
+        authkey: authKey,
+        accept: 'application/json',
       },
-      body,
     });
 
     if (!res.ok) {
@@ -137,7 +142,7 @@ export const sendMsg91Otp = async (
         success: true,
         isLiveMsg91: true,
         requestId: json.request_id,
-        messageEn: `OTP sent via MSG91 SMS to +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)}. Enter the 4-digit code below.`,
+        messageEn: `OTP sent via SMS to +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)}. Enter the ${OTP_LENGTH}-digit code below.${json.request_id ? ` (Ref: ${json.request_id})` : ''}`,
         messageTe: `OTP MSG91 SMS ద్వారా +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)} కు పంపబడింది. క్రింద 4 అంకెల కోడ నమోదు చేయండि.`,
       };
     }
@@ -174,19 +179,17 @@ export const verifyMsg91Otp = async (
   otpCode: string,
 ): Promise<VerifyOtpResult> => {
   const cleaned = cleanPhone(phone10Digit);
-  if (!/^\d{4}$/.test(otpCode)) {
+  if (otpCode.length !== OTP_LENGTH || !/^\d+$/.test(otpCode)) {
     return {
       success: false,
-      messageEn: 'Please enter the 4-digit OTP exactly.',
+      messageEn: `Please enter the ${OTP_LENGTH}-digit OTP exactly.`,
       messageTe: 'దయచేసి 4 అంకెల OTP ను ఖచ్చితంగ నమోదు చేయండీ.',
     };
   }
 
-  const authKey = getAuthKey();
-
-  // Sandbox: always accept 123456.
-  if (!authKey) {
-    if (otpCode === '123456') {
+  // Sandbox: accept the fixed code when live credentials are missing.
+  if (!isLiveMsg91Configured()) {
+    if (otpCode === SANDBOX_OTP) {
       return {
         success: true,
         messageEn: 'Login successful! Welcome to RythuVaani.',
@@ -195,14 +198,21 @@ export const verifyMsg91Otp = async (
     }
     return {
       success: false,
-      messageEn: 'Sandbox mode — use OTP 123456.',
-      messageTe: 'సాండ్‌బాక్స్ మోడ్ — OTP 123456 ఉపయోగింఛండి.',
+      messageEn: `Sandbox mode — use OTP ${SANDBOX_OTP}.`,
+      messageTe: `సాండ్‌బాక్స్ మోడ్ — OTP ${SANDBOX_OTP} ఉపయోగింఛండి.`,
     };
   }
 
+  const authKey = getAuthKey() as string;
+
   try {
+    const params = new URLSearchParams({
+      authkey: authKey,
+      otp: otpCode,
+      mobile: `91${cleaned}`,
+    });
     const res = await fetch(
-      `${MSG91_BASE_URL}/verify?authkey=${encodeURIComponent(authKey)}&otp=${encodeURIComponent(otpCode)}&mobile=91${cleaned}`,
+      `${MSG91_BASE_URL}/verify?${params.toString()}`,
       {
         method: 'GET',
         headers: {
@@ -271,25 +281,28 @@ export const resendMsg91Otp = async (
     };
   }
 
-  const authKey = getAuthKey();
-  if (!authKey) {
-    // Sandbox: just regenerate the same code.
+  // Sandbox: the fixed code stays valid; no network call needed.
+  if (!isLiveMsg91Configured()) {
     console.log('[MSG91] Sandbox — ignoring resend request');
     return {
       success: true,
-      messageEn: 'Sandbox: OTP remains 123456.',
-      messageTe: 'సాండ్‌బాక్స్: OTP 123456 గా ఉంటుంది.',
+      messageEn: `Sandbox: OTP remains ${SANDBOX_OTP}.`,
+      messageTe: `సాండ్‌బాక్స్: OTP ${SANDBOX_OTP} గా ఉంటుంది.`,
     };
   }
 
-  try {
-    const retryType = channel === 'voice' ? 'voice' : 'text';
-    const url = `${MSG91_BASE_URL}/retry?authkey=${encodeURIComponent(authKey)}&retrytype=${encodeURIComponent(retryType)}&mobile=91${cleaned}`;
+  const authKey = getAuthKey() as string;
 
-    const res = await fetch(url, {
+  try {
+    const params = new URLSearchParams({
+      authkey: authKey,
+      retrytype: channel === 'voice' ? 'voice' : 'text',
+      mobile: `91${cleaned}`,
+    });
+    const res = await fetch(`${MSG91_BASE_URL}/retry?${params.toString()}`, {
       method: 'GET',
       headers: {
-        'accept': 'application/json',
+        accept: 'application/json',
       },
     });
 

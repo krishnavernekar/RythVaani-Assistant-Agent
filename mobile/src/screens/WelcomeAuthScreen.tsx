@@ -20,6 +20,7 @@ import {
   sendMsg91Otp,
   verifyMsg91Otp,
   resendMsg91Otp,
+  OTP_LENGTH,
   type SendOtpResult,
   type VerifyOtpResult,
 } from '../services/msg91AuthService';
@@ -30,7 +31,7 @@ export default function WelcomeAuthScreen() {
   const isTe = language === 'te';
   const sarvamLang = language === 'en' ? 'en-IN' : language === 'hi' ? 'hi-IN' : 'te-IN';
 
-  const [mobileNumber, setMobileNumber] = useState('9848054321');
+  const [mobileNumber, setMobileNumber] = useState('');
   const [showOtpModal, setShowOtpModal] = useState(false);
   const [otp, setOtp] = useState('');
   const [otpResult, setOtpResult] = useState<SendOtpResult | null>(null);
@@ -38,6 +39,7 @@ export default function WelcomeAuthScreen() {
   const [sending, setSending] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [resending, setResending] = useState<'text' | 'voice' | null>(null);
+  const [resendError, setResendError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState(0);
   const countdownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -79,6 +81,7 @@ export default function WelcomeAuthScreen() {
     setSending(true);
     setOtpResult(null);
     setVerifyResult(null);
+    setResendError(null);
     setOtp('');
 
     const result = await sendMsg91Otp(cleaned);
@@ -104,7 +107,7 @@ export default function WelcomeAuthScreen() {
 
   const handleVerifyOtp = async () => {
     const cleaned = mobileNumber.replace(/[\s\-+]/g, '');
-    if (otp.length !== 4) {
+    if (otp.length !== OTP_LENGTH) {
       setVerifyResult({
         success: false,
         messageEn: dict.welcome.verifyError,
@@ -137,33 +140,57 @@ export default function WelcomeAuthScreen() {
     if (!isValidIndianMobile(cleaned)) return;
 
     setResending(channel);
+    setResendError(null);
     const result = await resendMsg91Otp(cleaned, channel);
     setResending(null);
 
     if (result.success) {
-      // Reset countdown
       setCountdown(30);
-      // Clear previous results
-      setOtpResult(null);
       setVerifyResult(null);
       setOtp('');
-
-      // Speak success
-      const voiceText = isTe ? result.messageTe : result.messageEn;
-      speak(voiceText, { language: sarvamLang });
+      speak(isTe ? result.messageTe : result.messageEn, { language: sarvamLang });
+    } else {
+      // Surface delivery errors (invalid template, no balance, rate limit...).
+      setResendError(isTe ? result.messageTe : result.messageEn);
     }
   };
 
-  const handleVoiceLogin = () => {
+  const handleVoiceLogin = async () => {
     stopSpeaking();
-    // Validate phone first
     const cleaned = mobileNumber.replace(/[\s\-+]/g, '');
     if (!isValidIndianMobile(cleaned)) {
+      setResendError(dict.welcome.phoneValidation);
       speak(dict.welcome.phoneValidation, { language: sarvamLang });
       return;
     }
-    // Send OTP via voice
-    handleResendOtp('voice');
+
+    // MSG91 can only "retry as voice" after an OTP has been created.
+    setSending(true);
+    setResendError(null);
+    const sendResult = await sendMsg91Otp(cleaned);
+    setSending(false);
+
+    if (!sendResult.success) {
+      setOtpResult(sendResult);
+      return;
+    }
+
+    const voiceResult = await resendMsg91Otp(cleaned, 'voice');
+    setOtpResult(
+      voiceResult.success
+        ? {
+            ...sendResult,
+            messageEn: `${sendResult.messageEn} ${voiceResult.messageEn}`,
+            messageTe: `${sendResult.messageTe} ${voiceResult.messageTe}`,
+          }
+        : sendResult,
+    );
+    if (!voiceResult.success) {
+      setResendError(isTe ? voiceResult.messageTe : voiceResult.messageEn);
+    }
+    setShowOtpModal(true);
+    setCountdown(30);
+    speak(isTe ? voiceResult.messageTe : voiceResult.messageEn, { language: sarvamLang });
   };
 
   const handleGuestMode = () => {
@@ -303,11 +330,11 @@ export default function WelcomeAuthScreen() {
           <TouchableOpacity
             style={[
               styles.primaryBtn,
-              (mobileNumber.length !== 10 || sending) && styles.primaryBtnDisabled,
+              (!isValidIndianMobile(mobileNumber) || sending) && styles.primaryBtnDisabled,
             ]}
             onPress={handleGetOtp}
             activeOpacity={0.85}
-            disabled={mobileNumber.length !== 10 || sending}
+            disabled={!isValidIndianMobile(mobileNumber) || sending}
           >
             {sending ? (
               <ActivityIndicator color="#FFFFFF" />
@@ -320,7 +347,9 @@ export default function WelcomeAuthScreen() {
 
           {otpResult && !otpResult.success && (
             <View style={styles.errorBanner}>
-              <Text style={styles.errorText}>{otpResult.messageEn}</Text>
+              <Text style={styles.errorText}>
+                {isTe ? otpResult.messageTe : otpResult.messageEn}
+              </Text>
             </View>
           )}
 
@@ -330,7 +359,7 @@ export default function WelcomeAuthScreen() {
             style={styles.voiceBtn}
             onPress={handleVoiceLogin}
             activeOpacity={0.85}
-            disabled={mobileNumber.length !== 10}
+            disabled={!isValidIndianMobile(mobileNumber)}
           >
             <Text style={styles.voiceBtnText}>
               🎙️ {dict.welcome.voiceLogin} →
@@ -386,6 +415,24 @@ export default function WelcomeAuthScreen() {
               {isTe ? dict.welcome.otpHelp : dict.welcome.otpSubtitle}
             </Text>
 
+            {/* Show the real MSG91 delivery status / request id to the farmer. */}
+            {otpResult && (
+              <View style={[
+                styles.verifyResultBox,
+                otpResult.success ? styles.verifySuccess : styles.verifyError,
+              ]}>
+                <Text style={styles.verifyResultText}>
+                  {isTe ? otpResult.messageTe : otpResult.messageEn}
+                </Text>
+              </View>
+            )}
+
+            {resendError && (
+              <View style={[styles.verifyResultBox, styles.verifyError]}>
+                <Text style={styles.verifyResultText}>⚠️ {resendError}</Text>
+              </View>
+            )}
+
             <TextInput
               style={styles.otpInput}
               placeholder="1234"
@@ -393,7 +440,7 @@ export default function WelcomeAuthScreen() {
               keyboardType="number-pad"
               value={otp}
               onChangeText={setOtp}
-              maxLength={4}
+              maxLength={OTP_LENGTH}
               autoFocus
             />
 
@@ -411,10 +458,10 @@ export default function WelcomeAuthScreen() {
             <TouchableOpacity
               style={[
                 styles.modalBtn,
-                (otp.length !== 6 || verifying) && styles.modalBtnDisabled,
+                (otp.length !== OTP_LENGTH || verifying) && styles.modalBtnDisabled,
               ]}
               onPress={handleVerifyOtp}
-              disabled={otp.length !== 6 || verifying}
+              disabled={otp.length !== OTP_LENGTH || verifying}
               activeOpacity={0.85}
             >
               {verifying ? (
