@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RythuVaani — Complete Project Summary</title>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 40px 20px; color: #1a1a1a; line-height: 1.6; }
+  h1 { color: #1B5E20; border-bottom: 3px solid #1B5E20; padding-bottom: 10px; }
+  h2 { color: #2E7D32; margin-top: 30px; border-bottom: 1px solid #A5D6A7; padding-bottom: 5px; }
+  h3 { color: #388E3C; }
+  table { width: 100%; border-collapse: collapse; margin: 15px 0; font-size: 13px; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th { background: #E8F5E9; font-weight: 700; }
+  tr:nth-child(even) { background: #F7F9F5; }
+  code { background: #F1F5F9; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  pre { background: #F1F5F9; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+  ul, ol { padding-left: 20px; }
+  li { margin: 4px 0; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; }
+  .done { background: #DCFCE7; color: #15803D; }
+  .meta { color: #666; font-size: 12px; margin-bottom: 20px; }
+  @media print { body { padding: 20px; } h1 { page-break-before: auto; } h2 { page-break-before: auto; } }
+</style>
+</head>
+<body>
+
+<h1>RythuVaani — Complete Project Summary</h1>
+<p class="meta">Date: November 19, 2026 | Platform: React Native (Expo) | Languages: Telugu, English, Hindi</p>
+
+<h2>1. Project Overview</h2>
+<p>RythuVaani is an AI-powered smart agronomy companion for farmers in Andhra Pradesh and Telangana. Features:</p>
+<ul>
+  <li>Voice-first AI agronomist consultation (Sarvam STT/TTS + LLM)</li>
+  <li>Crop health scanner (Gemini Vision)</li>
+  <li>Live mandi prices (Data.gov.in Agmarknet)</li>
+  <li>Government scheme eligibility verifier (6 AP/TG schemes)</li>
+  <li>Farmer profile &amp; vault (bookmarks, question history)</li>
+  <li>Real OTP authentication (MSG91)</li>
+  <li>Cloud database sync (Supabase PostgreSQL)</li>
+</ul>
+
+<h2>2. Architecture</h2>
+<pre>RythuVaani/
+├── docs/                    # PRD, Architecture, TRACK.md
+├── stitch-screens/          # UI prototype reference
+└── mobile/                  # React Native Expo app
+    ├── .env                 # API keys (gitignored)
+    ├── src/
+    │   ├── components/      # TopHeader, QuickToolCard
+    │   ├── i18n/            # translations.ts (te/en/hi)
+    │   ├── navigation/      # RootNavigator
+    │   ├── screens/         # All screens
+    │   ├── services/        # All service modules
+    │   ├── store/           # Zustand store
+    │   ├── theme/           # tokens.ts
+    │   └── utils/           # voice.ts</pre>
+
+<h3>Tech Stack</h3>
+<table>
+  <tr><th>Layer</th><th>Technology</th></tr>
+  <tr><td>Framework</td><td>Expo (React Native)</td></tr>
+  <tr><td>Navigation</td><td>React Navigation</td></tr>
+  <tr><td>State</td><td>Zustand + AsyncStorage</td></tr>
+  <tr><td>Voice</td><td>Sarvam AI (Saaras v4 STT, Bulbul v3 TTS) + expo-speech</td></tr>
+  <tr><td>AI</td><td>FreeLLMAPI (299 models) / Gemini / OpenRouter</td></tr>
+  <tr><td>Database</td><td>Supabase PostgreSQL (PostgREST)</td></tr>
+  <tr><td>Auth</td><td>MSG91 v5 OTP (SMS + Voice Call)</td></tr>
+  <tr><td>Mandi</td><td>Data.gov.in Agmarknet API</td></tr>
+</table>
+
+<h2>3. Epics Completed</h2>
+<table>
+  <tr><th>Epic</th><th>Module</th><th>Status</th></tr>
+  <tr><td>EPIC-01</td><td>Core Shell &amp; i18n</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-02</td><td>Home &amp; Quick Tools</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-03</td><td>Agromet Weather</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-04</td><td>Ask Agronomist Voice AI</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-05</td><td>AI Crop Health Scanner</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-06</td><td>e-NAM Mandi Rates</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-07 Pro</td><td>Govt Schemes Eligibility Verifier &amp; AI Advisor</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>EPIC-08</td><td>Farmer Profile &amp; Vault</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>MSG91</td><td>Real OTP Authentication</td><td><span class="badge done">✅ Done</span></td></tr>
+  <tr><td>Supabase</td><td>Cloud Database Sync</td><td><span class="badge done">✅ Done</span></td></tr>
+</table>
+
+<h3>EPIC-07 Pro: Government Schemes (Detailed)</h3>
+<p><strong>9-Input Zero-PII Wizard:</strong></p>
+<ul>
+  <li>Step 1 (33%): District/State (6 districts), Social Category (OC/BC/SC/ST), Income Tax/Govt Employee exclusion</li>
+  <li>Step 2 (66%): Exact acres (adjuster + chips), 4-way ownership, e-Panta status</li>
+  <li>Step 3 (100%): 5-crop multi-select, irrigation source, priority need</li>
+</ul>
+<p><strong>6 Authentic Schemes:</strong> Annadata Sukhibhava, PM-KISAN, APMIP Drip (90%), PMFBY Crop Insurance, YSR Sunna Vaddi (0% KCC), PM-KUSUM Solar/Machinery</p>
+<p><strong>3-Tier Financial Engine:</strong> ELIGIBLE / ACTION_REQUIRED / NOT_ELIGIBLE with matchScore, calculatedBenefit, verdictReason, decisionPriority, financialBreakdown</p>
+<p><strong>Full-Screen Modal:</strong> Personalized banner, ₹ breakdown, audio guide, document checklist with progress, offline/online steps, contacts, helplines, AI advisor with chips + voice mic, portal link (secondary)</p>
+
+<h2>4. Service Files</h2>
+<table>
+  <tr><th>Service</th><th>Purpose</th></tr>
+  <tr><td>agronomyAiService.ts</td><td>AI agronomist pipeline (FreeLLM/OpenRouter/Gemini/DeepSeek)</td></tr>
+  <tr><td>sarvamVoiceService.ts</td><td>Sarvam STT (Saaras v4) + TTS (Bulbul v3)</td></tr>
+  <tr><td>mandiService.ts</td><td>Data.gov.in Agmarknet + benchmark fallback</td></tr>
+  <tr><td>schemesService.ts</td><td>6 schemes, 3-tier evaluation, Gemini+FreeLLM+offline advisor</td></tr>
+  <tr><td>msg91AuthService.ts</td><td>MSG91 v5 OTP (SMS + Voice Call)</td></tr>
+  <tr><td>databaseService.ts</td><td>Supabase PostgREST client (6 functions)</td></tr>
+  <tr><td>weatherService.ts</td><td>Open-Meteo weather</td></tr>
+  <tr><td>apiDiagnostics.ts</td><td>Provider diagnostics</td></tr>
+</table>
+
+<h2>5. Environment Variables</h2>
+<p><strong>Real values live in the gitignored <code>mobile/.env</code>. Never commit keys.</strong></p>
+<pre>EXPO_PUBLIC_AI_PROVIDER=freellm
+EXPO_PUBLIC_FREELLM_BASE_URL=http://127.0.0.1:31415/v1
+EXPO_PUBLIC_FREELLM_API_KEY=&lt;your-freellm-api-key&gt;
+EXPO_PUBLIC_FREELLM_MODEL=auto
+EXPO_PUBLIC_SARVAM_API_KEY=&lt;your-sarvam-api-key&gt;
+EXPO_PUBLIC_DATA_GOV_API_KEY=&lt;your-data-gov-api-key&gt;
+EXPO_PUBLIC_MSG91_AUTH_KEY=&lt;your-msg91-auth-key&gt;
+EXPO_PUBLIC_MSG91_TEMPLATE_ID=&lt;your-msg91-template-id&gt;
+EXPO_PUBLIC_SUPABASE_URL=&lt;your-supabase-url&gt;
+EXPO_PUBLIC_SUPABASE_ANON_KEY=&lt;your-supabase-anon-key&gt;</pre>
+
+<h2>6. Verification Status</h2>
+<table>
+  <tr><th>Check</th><th>Result</th></tr>
+  <tr><td>npx tsc --noEmit</td><td>✅ 0 errors</td></tr>
+  <tr><td>npx expo lint</td><td>✅ 0 warnings</td></tr>
+  <tr><td>npx expo-doctor</td><td>✅ 20/20 checks passed</td></tr>
+  <tr><td>npx expo export --platform android</td><td>✅ Bundle resolves</td></tr>
+</table>
+
+<h2>7. Next Phases (Backlog)</h2>
+<ul>
+  <li><strong>EPIC-09:</strong> Guntur Field Pilot &amp; Release (sunlight audit, 3G tests, ANGRAU sign-off, Play Store)</li>
+  <li>Offline AI model (on-device LLM)</li>
+  <li>Push notifications for scheme deadlines</li>
+  <li>Multi-farmer support</li>
+  <li>Crop calendar integration</li>
+</ul>
+
+<h2>8. How to Continue on a New System</h2>
+<ol>
+  <li>Copy <code>.env</code> file (gitignored — contains all API keys)</li>
+  <li>Run <code>npm install</code> in <code>mobile/</code></li>
+  <li>Verify: <code>npx tsc --noEmit && npx expo lint && npx expo-doctor</code></li>
+  <li>Start: <code>npx expo start -c</code></li>
+</ol>
+
+<h3>Required External Services</h3>
+<ul>
+  <li><strong>FreeLLMAPI</strong> (desktop/Docker) — AI provider (port 31415)</li>
+  <li><strong>Supabase</strong> — Cloud database (configured)</li>
+  <li><strong>MSG91</strong> — OTP authentication (configured)</li>
+  <li><strong>Sarvam</strong> — Voice STT/TTS (configured)</li>
+  <li><strong>Data.gov.in</strong> — Mandi prices (configured)</li>
+</ul>
+
+<h2>9. Key Design Decisions</h2>
+<ol>
+  <li><strong>Zero-PII:</strong> Never collect Aadhaar, OTP, or bank details</li>
+  <li><strong>Offline-first:</strong> AsyncStorage cache + async cloud sync</li>
+  <li><strong>Fallback chains:</strong> FreeLLM → Gemini → Offline KB</li>
+  <li><strong>Bilingual:</strong> All UI and AI in Telugu + English (+ Hindi)</li>
+  <li><strong>Voice-first:</strong> Sarvam STT/TTS for non-literate farmers</li>
+  <li><strong>No synchronous setState in useEffect</strong></li>
+  <li><strong>Global audio guard:</strong> Navigation stops all audio</li>
+</ol>
+
+<hr>
+<p style="text-align:center; color:#666; font-size:12px;">Generated: November 19, 2026 | RythuVaani — AI Smart Agronomy Companion for AP &amp; Telangana Farmers</p>
+
+</body>
+</html>
