@@ -4,7 +4,16 @@
  * Used by the in-app diagnostics screen (Home → 🔧 AI Diagnostics).
  */
 
+import {
+  getMsg91Balance,
+  isMsg91WidgetMode,
+  looksLikeHexEncodedTemplateId,
+} from './msg91AuthService';
+
 const PROVIDER = (process.env.EXPO_PUBLIC_AI_PROVIDER || 'freellm').trim().toLowerCase();
+
+const MSG91_KEY = (process.env.EXPO_PUBLIC_MSG91_AUTH_KEY || '').trim();
+const MSG91_TEMPLATE = (process.env.EXPO_PUBLIC_MSG91_TEMPLATE_ID || '').trim();
 
 const OPENROUTER_KEY = (process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || '').trim();
 const OPENROUTER_MODEL = (process.env.EXPO_PUBLIC_OPENROUTER_MODEL || 'openrouter/auto').trim();
@@ -24,6 +33,12 @@ export interface ServiceStatus {
 export interface ApiStatus {
   ai: ServiceStatus & { provider: string; model: string };
   sarvam: ServiceStatus;
+  msg91: ServiceStatus & {
+    mode: 'widget' | 'classic';
+    smsBalance: number | null;
+    voiceBalance: number | null;
+    templateIdOk: boolean;
+  };
 }
 
 /** Test if a key is set and well-formed */
@@ -211,6 +226,60 @@ export async function testSarvamConnection(): Promise<{ connected: boolean; erro
   }
 }
 
+/** Check MSG91 credentials, template ID and wallet balance without sending an SMS. */
+async function testMsg91Connection(): Promise<ApiStatus['msg91']> {
+  const widgetMode = isMsg91WidgetMode();
+  const configured = Boolean(MSG91_KEY && MSG91_TEMPLATE);
+  const templateIdOk = widgetMode
+    ? Boolean(MSG91_TEMPLATE)
+    : Boolean(MSG91_TEMPLATE) && !looksLikeHexEncodedTemplateId(MSG91_TEMPLATE);
+
+  if (!configured) {
+    return {
+      configured: false,
+      keyFormatOk: false,
+      connected: false,
+      mode: widgetMode ? 'widget' : 'classic',
+      smsBalance: null,
+      voiceBalance: null,
+      templateIdOk,
+      error: 'MSG91 auth key / template ID not configured',
+    };
+  }
+
+  const [sms, voice] = await Promise.all([getMsg91Balance(1), getMsg91Balance(2)]);
+  const connected =
+    templateIdOk &&
+    sms.ok &&
+    voice.ok &&
+    (sms.balance ?? 0) > 0 &&
+    (voice.balance ?? 0) > 0;
+
+  let error: string | undefined;
+  if (!templateIdOk) {
+    error = 'Template ID looks hex-encoded — paste the plain ID from the MSG91 dashboard.';
+  } else if (!sms.ok) {
+    error = sms.error;
+  } else if ((sms.balance ?? 0) <= 0) {
+    error = 'SMS balance is 0 — recharge the MSG91 wallet.';
+  } else if (!voice.ok) {
+    error = voice.error;
+  } else if ((voice.balance ?? 0) <= 0) {
+    error = 'Voice balance is 0 — voice OTP calls will fail.';
+  }
+
+  return {
+    configured: true,
+    keyFormatOk: MSG91_KEY.length > 10,
+    connected,
+    mode: widgetMode ? 'widget' : 'classic',
+    smsBalance: sms.balance,
+    voiceBalance: voice.balance,
+    templateIdOk,
+    error,
+  };
+}
+
 function aiModelLabel(): string {
   if (PROVIDER === 'gemini') return GEMINI_MODEL;
   if (PROVIDER === 'openrouter') return OPENROUTER_MODEL;
@@ -228,13 +297,14 @@ export async function diagnoseApiConnections(): Promise<ApiStatus> {
   );
   const sarvamConfig = checkKeyConfig(SARVAM_KEY);
 
-  const [aiTest, sarvamTest] = await Promise.all([
+  const [aiTest, sarvamTest, msg91Test] = await Promise.all([
     aiConfig.configured
       ? testAiConnection()
       : Promise.resolve({ connected: false, error: 'Key not configured' }),
     sarvamConfig.configured
       ? testSarvamConnection()
       : Promise.resolve({ connected: false, error: 'Key not configured' }),
+    testMsg91Connection(),
   ]);
 
   const keyLooksValid =
@@ -259,5 +329,6 @@ export async function diagnoseApiConnections(): Promise<ApiStatus> {
       connected: sarvamTest.connected,
       error: sarvamTest.error,
     },
+    msg91: msg91Test,
   };
 }

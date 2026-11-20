@@ -67,6 +67,7 @@ export default function WelcomeAuthScreen() {
   };
 
   const handleGetOtp = async () => {
+    if (sending) return;
     const cleaned = mobileNumber.replace(/[\s\-+]/g, '');
     if (!isValidIndianMobile(cleaned)) {
       setOtpResult({
@@ -156,6 +157,7 @@ export default function WelcomeAuthScreen() {
   };
 
   const handleVoiceLogin = async () => {
+    if (sending || resending) return;
     stopSpeaking();
     const cleaned = mobileNumber.replace(/[\s\-+]/g, '');
     if (!isValidIndianMobile(cleaned)) {
@@ -334,7 +336,6 @@ export default function WelcomeAuthScreen() {
             ]}
             onPress={handleGetOtp}
             activeOpacity={0.85}
-            disabled={!isValidIndianMobile(mobileNumber) || sending}
           >
             {sending ? (
               <ActivityIndicator color="#FFFFFF" />
@@ -359,7 +360,6 @@ export default function WelcomeAuthScreen() {
             style={styles.voiceBtn}
             onPress={handleVoiceLogin}
             activeOpacity={0.85}
-            disabled={!isValidIndianMobile(mobileNumber)}
           >
             <Text style={styles.voiceBtnText}>
               🎙️ {dict.welcome.voiceLogin} →

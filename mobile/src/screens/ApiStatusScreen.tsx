@@ -67,10 +67,13 @@ export default function ApiStatusScreen() {
             : 'https://openrouter.ai/keys',
     );
   const openSarvamSetup = () => Linking.openURL('https://indus.sarvam.ai/key-management');
+  const openMsg91Setup = () => Linking.openURL('https://control.msg91.com/app/');
 
   const aiOk = provider === 'offline' || !!status?.ai.connected;
   const sarvamOk = !!status?.sarvam.connected;
-  const allOk = aiOk && sarvamOk;
+  const msg91Ok = !!status?.msg91.connected;
+  const allOk = aiOk && sarvamOk && msg91Ok;
+  const nextStep = [aiOk, sarvamOk, msg91Ok].filter(Boolean).length + 1;
 
   return (
     <View style={tokens.screenWrapper}>
@@ -79,12 +82,12 @@ export default function ApiStatusScreen() {
         {/* Status header */}
         <View style={styles.statusHeader}>
           <Text style={styles.statusTitle}>
-            {allOk ? '✅ All AI Services Connected' : '⚠️ AI Services Need Attention'}
+            {allOk ? '✅ All Services Connected' : '⚠️ Services Need Attention'}
           </Text>
           <Text style={styles.statusSub}>
             {allOk
-              ? 'The AI provider and Sarvam voice APIs are working. Live AI features are enabled.'
-              : 'Fix the issues below to enable live AI features.'}
+              ? 'AI, Sarvam voice and MSG91 OTP are working. Live features are enabled.'
+              : 'Fix the issues below to enable live AI and OTP login.'}
           </Text>
         </View>
 
@@ -123,6 +126,22 @@ export default function ApiStatusScreen() {
               fixLabel="Get Sarvam API Key"
             />
 
+            {/* MSG91 OTP Section */}
+            <ApiCard
+              title="MSG91 (SMS / Voice OTP)"
+              ok={msg91Ok}
+              error={status.msg91.error}
+              details={[
+                `Key configured: ${status.msg91.configured ? 'Yes' : 'No'}`,
+                `Mode: ${status.msg91.mode === 'widget' ? 'OTP Widget' : 'Classic OTP template'}`,
+                `Template / Widget ID: ${status.msg91.templateIdOk ? 'OK' : 'Check dashboard'}`,
+                `SMS balance: ${status.msg91.smsBalance ?? 'unknown'}`,
+                `Voice balance: ${status.msg91.voiceBalance ?? 'unknown'}`,
+              ]}
+              onFix={openMsg91Setup}
+              fixLabel="Open MSG91 Dashboard"
+            />
+
             {/* Fix Instructions */}
             {!allOk && (
               <View style={styles.instructionsCard}>
@@ -143,8 +162,16 @@ export default function ApiStatusScreen() {
                     onOpen={openSarvamSetup}
                   />
                 )}
+                {!msg91Ok && (
+                  <InstructionStep
+                    num={String([aiOk, sarvamOk].filter(Boolean).length + 1)}
+                    title="Fix MSG91 OTP"
+                    body="Recharge the MSG91 SMS and voice wallets. For OTP Widget keep EXPO_PUBLIC_MSG91_MODE=widget and the widgetId + tokenAuth from the widget menu. For classic OTP use EXPO_PUBLIC_MSG91_TEMPLATE_ID with the plain template ID (containing ##OTP##). Restart with npx expo start -c."
+                    onOpen={openMsg91Setup}
+                  />
+                )}
                 <InstructionStep
-                  num={aiOk && sarvamOk ? '1' : '3'}
+                  num={String(nextStep)}
                   title="Restart the App"
                   body="After updating .env, run: npx expo start -c (clears cache). The app will read the new keys on next launch."
                   onOpen={() => {}}

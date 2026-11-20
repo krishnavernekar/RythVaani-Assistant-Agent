@@ -2,8 +2,8 @@
  * RythuVaani API connectivity check (no dependencies).
  *
  * Reads mobile/.env directly, then tests the AI provider selected by
- * EXPO_PUBLIC_AI_PROVIDER plus Sarvam voice. Unconfigured optional keys
- * are reported as SKIPPED — not as failures.
+ * EXPO_PUBLIC_AI_PROVIDER, Sarvam voice and the MSG91 OTP wallet.
+ * Unconfigured optional keys are reported as SKIPPED — not as failures.
  *
  * Run: node test-apis.mjs
  */
@@ -53,6 +53,9 @@ const FREELLM_BASE_URL = (get('EXPO_PUBLIC_FREELLM_BASE_URL') || '').replace(/\/
 const FREELLM_KEY = get('EXPO_PUBLIC_FREELLM_API_KEY');
 const FREELLM_MODEL = get('EXPO_PUBLIC_FREELLM_MODEL') || 'auto';
 const SARVAM_KEY = get('EXPO_PUBLIC_SARVAM_API_KEY');
+const MSG91_KEY = get('EXPO_PUBLIC_MSG91_AUTH_KEY');
+const MSG91_TEMPLATE = get('EXPO_PUBLIC_MSG91_TEMPLATE_ID');
+const MSG91_MODE = get('EXPO_PUBLIC_MSG91_MODE') || (get('EXPO_PUBLIC_MSG91_WIDGET_ID') ? 'widget' : 'classic');
 
 const line = '='.repeat(62);
 console.log(line);
@@ -227,6 +230,59 @@ async function testSarvam() {
   }
 }
 
+/* ── MSG91 OTP wallet ──────────────────────────────────────────────────── */
+
+function looksHexEncoded(id) {
+  if (!/^[0-9a-fA-F]{24}$/.test(id)) return false;
+  const decoded = (id.match(/../g) || [])
+    .map((h) => String.fromCharCode(parseInt(h, 16)))
+    .join('');
+  return /^[\x20-\x7E]{8,}$/.test(decoded) && !/^[0-9a-fA-F]+$/.test(decoded);
+}
+
+async function readBalance(type) {
+  const res = await fetch(
+    `https://control.msg91.com/api/balance.php?authkey=${encodeURIComponent(MSG91_KEY)}&type=${type}`,
+    { headers: { accept: 'text/plain' } },
+  );
+  const body = (await res.text()).trim();
+  if (!res.ok || body.startsWith('{') || !Number.isFinite(Number(body))) {
+    throw new Error(`HTTP ${res.status}: ${body.slice(0, 120)}`);
+  }
+  return Number(body);
+}
+
+async function testMsg91() {
+  if (!MSG91_KEY || !MSG91_TEMPLATE) {
+    add('MSG91', 'SKIPPED', 'EXPO_PUBLIC_MSG91_AUTH_KEY / TEMPLATE_ID not set');
+    return;
+  }
+  console.log(`\n📍 MSG91 key: ${mask(MSG91_KEY)}`);
+  console.log(`   ${MSG91_MODE === 'widget' ? 'Widget ID' : 'Template ID'}: ${mask(MSG91_TEMPLATE)}`);
+  if (MSG91_MODE !== 'widget' && looksHexEncoded(MSG91_TEMPLATE)) {
+    add(
+      'MSG91',
+      'WARN',
+      'Template ID looks hex-encoded — paste the plain ID from the MSG91 dashboard',
+    );
+    return;
+  }
+  try {
+    const [sms, voice] = await Promise.all([readBalance(1), readBalance(2)]);
+    console.log(`   SMS balance: ${sms}, voice balance: ${voice}`);
+    if (sms <= 0 || voice <= 0) {
+      return add(
+        'MSG91',
+        'FAIL',
+        `wallet balance is zero (SMS ${sms}, voice ${voice}) — recharge at https://control.msg91.com/app/`,
+      );
+    }
+    add('MSG91', 'OK', `CONNECTED (SMS ${sms}, voice ${voice})`);
+  } catch (e) {
+    add('MSG91', 'FAIL', `balance check failed: ${e?.message || String(e)}`);
+  }
+}
+
 /* ── run ───────────────────────────────────────────────────────────────── */
 
 if (PROVIDER === 'openrouter') {
@@ -241,6 +297,7 @@ if (PROVIDER === 'openrouter') {
 }
 
 await testSarvam();
+await testMsg91();
 
 console.log('\n' + line);
 console.log('📊 Results');
@@ -251,11 +308,12 @@ for (const r of results) {
 }
 
 const failed = results.filter((r) => r.status === 'FAIL');
+const warnings = results.filter((r) => r.status === 'WARN');
 console.log('\n' + line);
-if (failed.length === 0) {
+if (failed.length === 0 && warnings.length === 0) {
   console.log('✅ All configured services are reachable. Run: npx expo start -c');
 } else {
-  console.log('❌ Some services failed — fix the entries marked FAIL above.');
+  console.log('❌ Some services need attention — fix the entries marked FAIL/WARN above.');
   console.log('   Note: the app still works offline via the ANGRAU knowledge base.');
 }
 console.log(line);
