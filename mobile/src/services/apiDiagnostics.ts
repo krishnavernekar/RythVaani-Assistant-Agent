@@ -42,11 +42,14 @@ async function readError(res: Response): Promise<string> {
 
 function describeHttpError(status: number, body: string): string {
   if (status === 401 || status === 403) return `Auth failed (HTTP ${status}): key is invalid or revoked`;
-  if (status === 402) return 'Out of credits (HTTP 402): top up the provider account';
+  if (status === 402) return 'Credits unavailable (HTTP 402): in-flight requests or empty balance — retry shortly';
   if (status === 404) return `Model unavailable (HTTP 404): choose another model in .env — ${body}`;
   if (status === 429) return 'Rate limited (HTTP 429): try again shortly';
   return `HTTP ${status}: ${body}`;
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 
 /** Ping the configured AI provider with a 1-token request. */
 export async function testAiConnection(): Promise<{ connected: boolean; error?: string }> {
@@ -100,34 +103,84 @@ export async function testAiConnection(): Promise<{ connected: boolean; error?: 
       return { connected: false, error: describeHttpError(res.status, await readError(res)) };
     }
 
-    // OpenRouter / OpenAI-compatible providers
+    // OpenRouter — replay the production JSON-mode request so CONNECTED means
+    // real advisories will work, not just that a tiny "OK" ping succeeded.
     const key = (process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || '').trim();
     if (!key) return { connected: false, error: 'No OpenRouter API key configured' };
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key}`,
-        'HTTP-Referer': 'https://rythuvaani.app',
-        'X-Title': 'RythuVaani',
+
+    const messages = [
+      {
+        role: 'system',
+        content:
+          'You are an ANGRAU agronomist. Reply ONLY with raw JSON (no markdown) with exactly ' +
+          'these keys: transcript_en, transcript_te, diagnosis_title_en, diagnosis_title_te, ' +
+          'advisory_en, advisory_te, chemical_dosage_en, chemical_dosage_te.',
       },
-      body: JSON.stringify({
-        model: OPENROUTER_MODEL,
-        messages: [{ role: 'user', content: 'Reply with the single word OK.' }],
-        temperature: 0.2,
-        max_tokens: 16,
-      }),
-    });
-    if (!res.ok) {
-      return { connected: false, error: describeHttpError(res.status, await readError(res)) };
+      {
+        role: 'user',
+        content:
+          'FARMER QUESTION: How to control yellow stem borer in my paddy crop? ' +
+          'Return the complete advisory JSON now.',
+      },
+    ];
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${key}`,
+            'HTTP-Referer': 'https://rythuvaani.app',
+            'X-Title': 'RythuVaani',
+          },
+          body: JSON.stringify({
+            model: OPENROUTER_MODEL,
+            messages,
+            temperature: 0.2,
+            max_tokens: 4000,
+            response_format: { type: 'json_object' },
+            provider: { require_parameters: true },
+          }),
+        });
+
+        if (res.status === 402 && attempt < 3) {
+          await sleep(1500 * 2 ** (attempt - 1));
+          continue;
+        }
+        if (!res.ok) {
+          return { connected: false, error: describeHttpError(res.status, await readError(res)) };
+        }
+
+        const data = await res.json().catch(() => null);
+        const raw = data?.choices?.[0]?.message?.content;
+        const text = typeof raw === 'string' ? raw : '';
+        const start = text.indexOf('{');
+        const end = text.lastIndexOf('}');
+        let usable = false;
+        try {
+          const parsed = JSON.parse(start >= 0 && end > start ? text.slice(start, end + 1) : text);
+          usable = ['advisory_en', 'diagnosis_title_en'].some(
+            (field) => typeof parsed?.[field] === 'string' && parsed[field].trim().length > 0,
+          );
+        } catch {
+          // empty / prose / truncated JSON — retry below
+        }
+        if (usable) return { connected: true };
+        if (attempt < 3) {
+          await sleep(750 * 2 ** (attempt - 1));
+          continue;
+        }
+        const finish = data?.choices?.[0]?.finish_reason || 'unknown';
+        return {
+          connected: false,
+          error: `Model returned unusable JSON (finish_reason=${finish}) — check the model in .env`,
+        };
+      } catch (e: any) {
+        return { connected: false, error: `Network error: ${e?.message || String(e)}` };
+      }
     }
-    // A 200 with no message content means real advisory requests will fail too.
-    const data = await res.json().catch(() => null);
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content === 'string' && content.trim().length > 0) {
-      return { connected: true };
-    }
-    return { connected: false, error: 'Provider returned an empty answer — check the model in .env' };
+    return { connected: false, error: 'AI provider did not respond' };
   } catch (e: any) {
     return { connected: false, error: `Network error: ${e?.message || String(e)}` };
   }

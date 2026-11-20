@@ -336,6 +336,47 @@ function matchOfflineAdvisory(query: string): AiResponse {
 
 /* ──────────────────────── Response parsing ─────────────────────────── */
 
+/**
+ * Reasoning models can hit max_tokens mid-object. Close the open strings/braces
+ * (or drop the last partial field) so a mostly-complete advisory is still usable.
+ */
+function repairTruncatedJson(text: string): string | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let lastTopLevelComma = -1;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ']') depth -= 1;
+    else if (ch === ',' && depth === 1) lastTopLevelComma = i;
+  }
+
+  if (depth <= 0) return null;
+
+  const closeOpenObject = `${inString ? '"' : ''}${'}'.repeat(depth)}`;
+  const candidates = [`${text}${closeOpenObject}`];
+  if (lastTopLevelComma > 0) candidates.push(`${text.slice(0, lastTopLevelComma)}}`);
+
+  for (const candidate of candidates) {
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      // try the next repair strategy
+    }
+  }
+  return null;
+}
+
 const safeParseJSON = (text: string): AiResponse | null => {
   try {
     // Some models still wrap JSON in markdown fences even when told not to.
@@ -346,7 +387,15 @@ const safeParseJSON = (text: string): AiResponse | null => {
     const start = cleaned.indexOf('{');
     const end = cleaned.lastIndexOf('}');
     const candidate = start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned;
-    const parsed = JSON.parse(candidate);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch (parseError) {
+      const repaired = repairTruncatedJson(candidate);
+      if (!repaired) throw parseError;
+      console.warn('[AI] Repaired truncated JSON from provider');
+      parsed = JSON.parse(repaired);
+    }
 
     const response: AiResponse = {
       transcript_en: String(parsed.transcript_en ?? ''),
@@ -445,6 +494,10 @@ interface OpenAICompatibleConfig {
   /** Tried in order; a retired model (404) moves on to the next one */
   models: string[];
   extraHeaders?: Record<string, string>;
+  /** Ask for JSON output and (on OpenRouter) only route to models that support it */
+  responseFormatJson?: boolean;
+  /** Reasoning models spend max_tokens on thinking — give them room to finish. */
+  maxTokens?: number;
 }
 
 /** Convert Gemini-style parts to OpenAI chat content (images become data URLs). */
@@ -496,21 +549,9 @@ function extractChatText(data: any): string {
     }
   }
 
-  // Reasoning models sometimes put the whole answer in reasoning_details while
-  // leaving `content` empty. Accept it as a last resort.
-  if (parts.join('').trim().length === 0) {
-    if (typeof message.reasoning === 'string') parts.push(message.reasoning);
-    if (Array.isArray(message.reasoning_details)) {
-      for (const detail of message.reasoning_details) {
-        if (typeof detail?.text === 'string') parts.push(detail.text);
-      }
-    }
-  }
-
-  if (parts.join('').trim().length === 0 && typeof message.refusal === 'string') {
-    lastProviderError = `Model refused the request: ${message.refusal}`.slice(0, 300);
-  }
-
+  // Never treat `reasoning` / `reasoning_details` as the answer. They contain
+  // private chain-of-thought such as "we need to respond in json only", which
+  // previously got fed to the JSON parser and produced the console error.
   return parts.join('').trim();
 }
 
@@ -518,9 +559,9 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Call any OpenAI-compatible `/chat/completions` endpoint.
- * - retries 429/5xx with backoff
- * - walks through `models` when one has been retired (404)
- * - returns null on auth/credit failure so the caller falls back to the ANGRAU KB
+ * - retries 402 (in-flight credits), 429/5xx and empty/unusable answers with backoff
+ * - walks through `models` when one is retired or doesn't support JSON mode
+ * - returns null on auth failure so the caller falls back to the ANGRAU KB
  */
 async function callOpenAICompatible(
   config: OpenAICompatibleConfig,
@@ -532,7 +573,7 @@ async function callOpenAICompatible(
   }
 
   const models = config.models.filter(Boolean).filter((m, i, a) => a.indexOf(m) === i);
-  const maxAttempts = 3;
+  const maxAttempts = config.responseFormatJson ? 4 : 3;
   const retryableStatuses = new Set([429, 500, 502, 503, 504]);
   const messages = toChatMessages(parts);
 
@@ -546,30 +587,55 @@ async function callOpenAICompatible(
             Authorization: `Bearer ${config.apiKey}`,
             ...config.extraHeaders,
           },
-          // Keep the body to universally supported parameters. `response_format`
-          // made `openrouter/auto` pick (and then reject) models that ignore it.
+          // For OpenRouter, request JSON mode and require providers that support
+          // every parameter. Without require_parameters, `openrouter/auto` can
+          // route to reasoning models that return content:null / prose in
+          // `reasoning` and leave no visible JSON answer.
           body: JSON.stringify({
             model,
             messages,
             temperature: 0.2,
-            max_tokens: 1600,
+            max_tokens: config.maxTokens ?? 1600,
+            ...(config.responseFormatJson ? { response_format: { type: 'json_object' } } : {}),
+            ...(config.responseFormatJson ? { provider: { require_parameters: true } } : {}),
           }),
         });
 
         if (res.ok) {
           const data = await res.json();
+          const choice = data?.choices?.[0] ?? {};
           const text = extractChatText(data);
+          const finishReason = choice?.finish_reason;
+          const reasoningOnly =
+            text.length === 0 &&
+            (typeof choice?.message?.reasoning === 'string' ||
+              Array.isArray(choice?.message?.reasoning_details));
+
           if (!text) {
-            lastProviderError = `${config.label} (${model}) returned an empty response`;
-            console.error(`[${config.label}] Empty response for ${model}`);
+            lastProviderError =
+              `${config.label} (${model}) returned empty content ` +
+              `(finish_reason=${finishReason || 'unknown'}${reasoningOnly ? ', reasoning only' : ''})`;
+            console.error(`[${config.label}] ${lastProviderError}`);
+            if (attempt < maxAttempts) {
+              await sleep(750 * 2 ** (attempt - 1));
+              continue; // same model often succeeds on the next try
+            }
             break; // try the next model instead of giving up
           }
+
           const parsed = safeParseJSON(text);
           if (!parsed) {
-            lastProviderError = `${config.label} (${model}) returned an unreadable advisory`;
-            console.error(`[${config.label}] Unusable JSON for ${model}:`, text.slice(0, 200));
+            lastProviderError =
+              `${config.label} (${model}) returned unusable JSON ` +
+              `(finish_reason=${finishReason || 'unknown'})`;
+            console.error(`[${config.label}] ${lastProviderError}:`, text.slice(0, 200));
+            if (attempt < maxAttempts) {
+              await sleep(750 * 2 ** (attempt - 1));
+              continue; // retry before abandoning this model
+            }
             break; // try the next model
           }
+
           lastProviderError = null;
           console.log(`[${config.label}] answered with ${data?.model || model}`);
           return parsed;
@@ -590,8 +656,18 @@ async function callOpenAICompatible(
         if (res.status === 400) break; // unsupported parameter/model option → next model
         if (res.status === 401 || res.status === 403) return null; // bad key — stop
         if (res.status === 402) {
-          console.error(`[${config.label}] Out of credits for ${model}`);
-          return null;
+          // OpenRouter returns 402 while previous requests are still in flight,
+          // not only when the balance is exhausted. Retry before giving up.
+          const inFlight = /in-flight|in flight|available credits given/i.test(errorBody);
+          lastProviderError = inFlight
+            ? `${config.label} (${model}) credits busy with in-flight requests — retrying`
+            : `${config.label} HTTP 402 (${model}): ${errorBody.slice(0, 160)}`;
+          console.error(`[${config.label}] ${lastProviderError}`);
+          if (attempt < maxAttempts) {
+            await sleep(1500 * 2 ** (attempt - 1));
+            continue;
+          }
+          break; // try a fallback model
         }
         if (retryableStatuses.has(res.status) && attempt < maxAttempts) {
           await sleep(1000 * 2 ** (attempt - 1));
@@ -640,6 +716,8 @@ async function callOpenRouter(parts: GeminiPart[]): Promise<AiResponse | null> {
         'HTTP-Referer': 'https://rythuvaani.app',
         'X-Title': 'RythuVaani',
       },
+      responseFormatJson: true,
+      maxTokens: 4000,
     },
     parts,
   );
