@@ -12,8 +12,16 @@ import {
 
 const PROVIDER = (process.env.EXPO_PUBLIC_AI_PROVIDER || 'freellm').trim().toLowerCase();
 
-const MSG91_KEY = (process.env.EXPO_PUBLIC_MSG91_AUTH_KEY || '').trim();
-const MSG91_TEMPLATE = (process.env.EXPO_PUBLIC_MSG91_TEMPLATE_ID || '').trim();
+const MSG91_KEY = (
+  process.env.EXPO_PUBLIC_MSG91_TOKEN_AUTH ||
+  process.env.EXPO_PUBLIC_MSG91_AUTH_KEY ||
+  ''
+).trim();
+const MSG91_TEMPLATE = (
+  process.env.EXPO_PUBLIC_MSG91_WIDGET_ID ||
+  process.env.EXPO_PUBLIC_MSG91_TEMPLATE_ID ||
+  ''
+).trim();
 
 const OPENROUTER_KEY = (process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || '').trim();
 const OPENROUTER_MODEL = (process.env.EXPO_PUBLIC_OPENROUTER_MODEL || 'openrouter/auto').trim();

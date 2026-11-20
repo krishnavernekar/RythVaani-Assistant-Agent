@@ -166,7 +166,7 @@ export default function ApiStatusScreen() {
                   <InstructionStep
                     num={String([aiOk, sarvamOk].filter(Boolean).length + 1)}
                     title="Fix MSG91 OTP"
-                    body="Recharge the MSG91 SMS and voice wallets. For OTP Widget keep EXPO_PUBLIC_MSG91_MODE=widget and the widgetId + tokenAuth from the widget menu. For classic OTP use EXPO_PUBLIC_MSG91_TEMPLATE_ID with the plain template ID (containing ##OTP##). Restart with npx expo start -c."
+                    body="Use only EXPO_PUBLIC_MSG91_WIDGET_ID and EXPO_PUBLIC_MSG91_TOKEN_AUTH in widget mode. Recharge the MSG91 wallets and disable captcha on the widget if MSG91 asks for a captcha token. Restart with npx expo start -c."
                     onOpen={openMsg91Setup}
                   />
                 )}

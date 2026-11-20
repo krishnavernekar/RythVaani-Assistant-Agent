@@ -47,6 +47,17 @@ const getTemplateId = (): string | null => {
   return id && id.length > 0 ? id : null;
 };
 
+/** OTP Widget credentials — the only parameters needed in widget mode. */
+const getWidgetId = (): string | null => {
+  const id = process.env.EXPO_PUBLIC_MSG91_WIDGET_ID?.trim();
+  return (id || getTemplateId() || '').trim() || null;
+};
+
+const getTokenAuth = (): string | null => {
+  const token = process.env.EXPO_PUBLIC_MSG91_TOKEN_AUTH?.trim();
+  return (token || getAuthKey() || '').trim() || null;
+};
+
 /**
  * MSG91 has two OTP products. The credentials in this project came from the
  * OTP Widget snippet (widgetId + tokenAuth), so set EXPO_PUBLIC_MSG91_MODE=widget.
@@ -56,13 +67,10 @@ const MSG91_MODE = (process.env.EXPO_PUBLIC_MSG91_MODE || '').trim().toLowerCase
 export const isMsg91WidgetMode = (): boolean =>
   MSG91_MODE === 'widget' || Boolean(process.env.EXPO_PUBLIC_MSG91_WIDGET_ID?.trim());
 
-const getWidgetId = (): string | null => {
-  const explicit = process.env.EXPO_PUBLIC_MSG91_WIDGET_ID?.trim();
-  return (explicit || getTemplateId() || '').trim() || null;
-};
-
 export const isLiveMsg91Configured = (): boolean =>
-  Boolean(getAuthKey() && (isMsg91WidgetMode() ? getWidgetId() : getTemplateId()));
+  isMsg91WidgetMode()
+    ? Boolean(getWidgetId() && getTokenAuth())
+    : Boolean(getAuthKey() && getTemplateId());
 
 /** The app consistently uses a 4-digit OTP (matches the UI input length). */
 export const OTP_LENGTH = 4;
@@ -95,31 +103,31 @@ export interface Msg91BalanceResult {
  * send/retry endpoint fail, so check it before showing a fake "OTP sent".
  */
 export const getMsg91Balance = async (type: 1 | 2 = 1): Promise<Msg91BalanceResult> => {
-  const authKey = getAuthKey();
-  if (!authKey) return { ok: false, balance: null, error: 'MSG91 auth key is not configured' };
-
-  try {
-    const res = await fetchWithTimeout(
-      `https://control.msg91.com/api/balance.php?authkey=${encodeURIComponent(authKey)}&type=${type}`,
-      { headers: { accept: 'text/plain' } },
-    );
-    const body = (await res.text()).trim();
-    const balance = Number(body);
-    if (!res.ok || body.startsWith('{') || !Number.isFinite(balance)) {
-      return {
-        ok: false,
-        balance: null,
-        error: `Could not read MSG91 ${type === 1 ? 'SMS' : 'voice'} balance (HTTP ${res.status})`,
-      };
-    }
-    return { ok: true, balance };
-  } catch (error) {
-    return {
-      ok: false,
-      balance: null,
-      error: `MSG91 balance check failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
+  const candidates = [getAuthKey(), getTokenAuth()].filter(
+    (value, index, all): value is string => Boolean(value) && all.indexOf(value) === index,
+  );
+  if (candidates.length === 0) {
+    return { ok: false, balance: null, error: 'MSG91 auth key / tokenAuth is not configured' };
   }
+
+  let lastError = 'Could not read MSG91 balance';
+  for (const key of candidates) {
+    try {
+      const res = await fetchWithTimeout(
+        `https://control.msg91.com/api/balance.php?authkey=${encodeURIComponent(key)}&type=${type}`,
+        { headers: { accept: 'text/plain' } },
+      );
+      const body = (await res.text()).trim();
+      const balance = Number(body);
+      if (res.ok && !body.startsWith('{') && Number.isFinite(balance)) {
+        return { ok: true, balance };
+      }
+      lastError = `Could not read MSG91 ${type === 1 ? 'SMS' : 'voice'} balance (HTTP ${res.status})`;
+    } catch (error) {
+      lastError = `MSG91 balance check failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+  return { ok: false, balance: null, error: lastError };
 };
 
 /** The stored template ID must be the plain ID from the dashboard, not hex text. */
@@ -216,7 +224,9 @@ async function sendWidgetOtp(cleaned: string, authKey: string): Promise<SendOtpR
       console.error('[MSG91 Widget Send]', detail);
       const friendly = /widget disabled/i.test(detail)
         ? 'MSG91 OTP Widget is disabled. Enable it in the MSG91 dashboard, or switch to classic OTP with a real template ID.'
-        : `MSG91: ${detail}`;
+        : /captcha/i.test(detail)
+          ? 'MSG91 widget requires a captcha token. Disable captcha for this widget in the MSG91 dashboard, then retry.'
+          : `MSG91: ${detail}`;
       return {
         success: false,
         isLiveMsg91: true,
@@ -274,7 +284,7 @@ export const sendMsg91Otp = async (
     };
   }
 
-  const authKey = getAuthKey() as string;
+  const authKey = (isMsg91WidgetMode() ? getTokenAuth() : getAuthKey()) as string;
   const templateId = getTemplateId() as string;
 
   if (looksLikeHexEncodedTemplateId(templateId)) {
@@ -483,7 +493,7 @@ export const verifyMsg91Otp = async (
     };
   }
 
-  const authKey = getAuthKey() as string;
+  const authKey = (isMsg91WidgetMode() ? getTokenAuth() : getAuthKey()) as string;
 
   if (isMsg91WidgetMode()) {
     return verifyWidgetOtp(cleaned, otpCode, authKey);
@@ -575,7 +585,7 @@ export const resendMsg91Otp = async (
     };
   }
 
-  const authKey = getAuthKey() as string;
+  const authKey = (isMsg91WidgetMode() ? getTokenAuth() : getAuthKey()) as string;
 
   if (isMsg91WidgetMode()) {
     return resendWidgetOtp(cleaned, channel, authKey);
