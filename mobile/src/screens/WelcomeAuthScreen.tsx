@@ -12,6 +12,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import { Colors, spacing, tokens } from '../theme/tokens';
+import Msg91WidgetBridge from '../components/Msg91WidgetBridge';
 import { speak, stopSpeaking } from '../utils/voice';
 import { Language, useAppStore } from '../store/useAppStore';
 import { getDict, getLineHeight } from '../i18n/translations';
@@ -212,6 +213,8 @@ export default function WelcomeAuthScreen() {
       style={tokens.screenWrapper}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
+      {/* Loads the official MSG91 SDK (invisible hCaptcha) before OTP is requested. */}
+      <Msg91WidgetBridge />
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"

@@ -2,7 +2,7 @@
  * RythuVaani API connectivity check (no dependencies).
  *
  * Reads mobile/.env directly, then tests the AI provider selected by
- * EXPO_PUBLIC_AI_PROVIDER, Sarvam voice and the MSG91 OTP wallet.
+ * EXPO_PUBLIC_AI_PROVIDER, Sarvam voice and MSG91 (widget config or classic wallet).
  * Unconfigured optional keys are reported as SKIPPED — not as failures.
  *
  * Run: node test-apis.mjs
@@ -230,7 +230,7 @@ async function testSarvam() {
   }
 }
 
-/* ── MSG91 OTP wallet / widget ─────────────────────────────────────────── */
+/* ── MSG91 OTP widget / wallet ─────────────────────────────────────────── */
 
 function looksHexEncoded(id) {
   if (!/^[0-9a-fA-F]{24}$/.test(id)) return false;
@@ -252,52 +252,61 @@ async function readBalance(type) {
   return Number(body);
 }
 
-/** Probe the widget with an undeliverable number — validates credentials without sending an OTP. */
-async function probeWidget() {
+/**
+ * Validate widget credentials via getWidgetProcess. Do NOT call sendOtp here:
+ * the widget has invisible hCaptcha, so a plain REST call always returns
+ * "Invalid Captcha Token" even with credentials that work in real projects.
+ * The app's hidden WebView runs the official SDK, which supplies that token.
+ */
+async function probeWidgetConfig() {
   try {
-    const res = await fetch('https://api.msg91.com/api/v5/widget/sendOtp', {
-      method: 'POST',
+    const url = `https://control.msg91.com/api/v5/widget/getWidgetProcess?widgetId=${encodeURIComponent(MSG91_TEMPLATE)}`;
+    const res = await fetch(url, {
       headers: {
+        Accept: 'application/json',
         'Content-Type': 'application/json',
-        accept: 'application/json',
-        authkey: MSG91_KEY,
-      },
-      body: JSON.stringify({
-        widgetId: MSG91_TEMPLATE,
         tokenAuth: MSG91_KEY,
-        identifier: '910000000000',
-      }),
+      },
     });
     const text = (await res.text()).trim();
     let json = {};
-    try { json = text ? JSON.parse(text) : {}; } catch { json = { message: text }; }
-    const msg = json.message || json.error || text || `HTTP ${res.status}`;
-    if (/captcha/i.test(msg)) {
-      return { status: 'FAIL', detail: 'widget captcha is enabled — disable captcha in MSG91 widget settings' };
+    try { json = text ? JSON.parse(text) : {}; } catch { json = {}; }
+    const data = json?.data ?? json;
+
+    if (!res.ok) {
+      return { status: 'FAIL', detail: `widget check HTTP ${res.status}: ${json?.message || text.slice(0, 100)}` };
     }
-    if (/widget disabled/i.test(msg)) {
-      return { status: 'FAIL', detail: 'widget is disabled — enable it in the MSG91 dashboard' };
+    const enabled = data?.status?.value === '1' || json?.status === 'success';
+    if (!enabled) {
+      return { status: 'FAIL', detail: json?.message || 'widget is disabled — enable it in the MSG91 dashboard' };
     }
-    if (/widget not found/i.test(msg)) {
-      return { status: 'FAIL', detail: `widget ID not found — ${msg}`.slice(0, 160) };
-    }
-    if (/invalid.*(number|mobile|identifier)/i.test(msg) || /otp sent/i.test(msg) || json.type === 'success') {
-      return { status: 'OK', detail: 'widget reachable' };
-    }
-    return { status: 'WARN', detail: `widget probe: ${msg}`.slice(0, 160) };
+
+    const captchaNote = data?.captchaValidations
+      ? 'invisible captcha handled by MSG91 SDK'
+      : 'no captcha configured';
+    const otpLength = data?.otpLength ? `, OTP length ${data.otpLength}` : '';
+    return { status: 'OK', detail: `widget enabled, ${captchaNote}${otpLength}` };
   } catch (e) {
-    return { status: 'FAIL', detail: `widget probe network error: ${e?.message || String(e)}` };
+    return { status: 'FAIL', detail: `widget check network error: ${e?.message || String(e)}` };
   }
 }
 
 async function testMsg91() {
   if (!MSG91_KEY || !MSG91_TEMPLATE) {
-    add('MSG91', 'SKIPPED', 'MSG91_WIDGET_ID / MSG91_TOKEN_AUTH not set');
+    add('MSG91', 'SKIPPED', 'EXPO_PUBLIC_MSG91_WIDGET_ID / EXPO_PUBLIC_MSG91_TOKEN_AUTH not set');
     return;
   }
   console.log(`\n📍 MSG91 ${MSG91_MODE === 'widget' ? 'tokenAuth' : 'auth key'}: ${mask(MSG91_KEY)}`);
   console.log(`   ${MSG91_MODE === 'widget' ? 'Widget ID' : 'Template ID'}: ${mask(MSG91_TEMPLATE)}`);
-  if (MSG91_MODE !== 'widget' && looksHexEncoded(MSG91_TEMPLATE)) {
+
+  if (MSG91_MODE === 'widget') {
+    const probe = await probeWidgetConfig();
+    console.log(`   Widget config: ${probe.detail}`);
+    add('MSG91', probe.status, probe.status === 'OK' ? `CONNECTED (${probe.detail})` : probe.detail);
+    return;
+  }
+
+  if (looksHexEncoded(MSG91_TEMPLATE)) {
     add(
       'MSG91',
       'WARN',
@@ -318,12 +327,6 @@ async function testMsg91() {
     }
   } catch (e) {
     findings.push({ status: 'FAIL', detail: `balance check failed: ${e?.message || String(e)}` });
-  }
-
-  if (MSG91_MODE === 'widget') {
-    const probe = await probeWidget();
-    console.log(`   Widget probe: ${probe.detail}`);
-    findings.push(probe);
   }
 
   const detail = findings.map((f) => f.detail).join(' | ');

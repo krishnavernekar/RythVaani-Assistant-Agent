@@ -74,6 +74,26 @@ export default function ApiStatusScreen() {
   const msg91Ok = !!status?.msg91.connected;
   const allOk = aiOk && sarvamOk && msg91Ok;
   const nextStep = [aiOk, sarvamOk, msg91Ok].filter(Boolean).length + 1;
+  const widgetMode = status?.msg91.mode === 'widget';
+  const msg91Details: string[] = widgetMode
+    ? [
+        `Key configured: ${status?.msg91.configured ? 'Yes' : 'No'}`,
+        'Mode: OTP Widget (official MSG91 SDK)',
+        `Widget ID: ${status?.msg91.templateIdOk ? 'OK' : 'Check dashboard'}`,
+        `Widget status: ${status?.msg91.widgetEnabled ? 'Enabled' : 'Not enabled'}`,
+        `Captcha: ${status?.msg91.widgetCaptcha ? 'Invisible hCaptcha (handled by SDK)' : 'Not required'}`,
+        `OTP length: ${status?.msg91.widgetOtpLength ?? 'widget default'}`,
+      ]
+    : [
+        `Key configured: ${status?.msg91.configured ? 'Yes' : 'No'}`,
+        'Mode: Classic OTP template',
+        `Template ID: ${status?.msg91.templateIdOk ? 'OK' : 'Check dashboard'}`,
+        `SMS balance: ${status?.msg91.smsBalance ?? 'unknown'}`,
+        `Voice balance: ${status?.msg91.voiceBalance ?? 'unknown'}`,
+      ];
+  const msg91FixBody = widgetMode
+    ? 'Use EXPO_PUBLIC_MSG91_MODE=widget with EXPO_PUBLIC_MSG91_WIDGET_ID and EXPO_PUBLIC_MSG91_TOKEN_AUTH from the same MSG91 project. The app loads the official MSG91 SDK, which handles invisible captcha automatically — do not disable captcha or rely on the wallet check. Restart with npx expo start -c.'
+    : 'Use a real classic OTP Template ID and auth key, then recharge the MSG91 SMS/voice wallets if they are zero. Restart with npx expo start -c.';
 
   return (
     <View style={tokens.screenWrapper}>
@@ -131,13 +151,7 @@ export default function ApiStatusScreen() {
               title="MSG91 (SMS / Voice OTP)"
               ok={msg91Ok}
               error={status.msg91.error}
-              details={[
-                `Key configured: ${status.msg91.configured ? 'Yes' : 'No'}`,
-                `Mode: ${status.msg91.mode === 'widget' ? 'OTP Widget' : 'Classic OTP template'}`,
-                `Template / Widget ID: ${status.msg91.templateIdOk ? 'OK' : 'Check dashboard'}`,
-                `SMS balance: ${status.msg91.smsBalance ?? 'unknown'}`,
-                `Voice balance: ${status.msg91.voiceBalance ?? 'unknown'}`,
-              ]}
+              details={msg91Details}
               onFix={openMsg91Setup}
               fixLabel="Open MSG91 Dashboard"
             />
@@ -166,7 +180,7 @@ export default function ApiStatusScreen() {
                   <InstructionStep
                     num={String([aiOk, sarvamOk].filter(Boolean).length + 1)}
                     title="Fix MSG91 OTP"
-                    body="Use only EXPO_PUBLIC_MSG91_WIDGET_ID and EXPO_PUBLIC_MSG91_TOKEN_AUTH in widget mode. Recharge the MSG91 wallets and disable captcha on the widget if MSG91 asks for a captcha token. Restart with npx expo start -c."
+                    body={msg91FixBody}
                     onOpen={openMsg91Setup}
                   />
                 )}

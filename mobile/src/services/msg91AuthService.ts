@@ -11,7 +11,13 @@
  *
  * Never stores or returns Aadhaar / OTP / bank account numbers inside the
  * app — the phone number is the only PII collected at login.
+ *
+ * Widget mode runs the official MSG91 JS SDK in a hidden WebView because the
+ * widget has invisible hCaptcha enabled; a plain fetch() cannot generate the
+ * required captcha token. See Msg91WidgetBridge.tsx.
  */
+
+import { msg91WidgetBridge } from '../components/Msg91WidgetBridge';
 
 /* ────────────────────────────── Types ──────────────────────────────────── */
 
@@ -99,8 +105,8 @@ export interface Msg91BalanceResult {
 
 /**
  * Read the MSG91 wallet balance without sending an SMS. `type=1` is the SMS
- * wallet used by OTP; `type=2` is voice credits. A zero balance makes every
- * send/retry endpoint fail, so check it before showing a fake "OTP sent".
+ * wallet; `type=2` is voice credits. Used only in classic mode — widget mode
+ * has its own billing and must not be blocked by this check.
  */
 export const getMsg91Balance = async (type: 1 | 2 = 1): Promise<Msg91BalanceResult> => {
   const candidates = [getAuthKey(), getTokenAuth()].filter(
@@ -128,6 +134,60 @@ export const getMsg91Balance = async (type: 1 | 2 = 1): Promise<Msg91BalanceResu
     }
   }
   return { ok: false, balance: null, error: lastError };
+};
+
+/** Widget-mode health check — validates credentials without sending an OTP. */
+export interface Msg91WidgetStatus {
+  ok: boolean;
+  enabled: boolean;
+  captcha: boolean;
+  otpLength: number | null;
+  error?: string;
+}
+
+export const probeMsg91Widget = async (): Promise<Msg91WidgetStatus> => {
+  const widgetId = getWidgetId();
+  const tokenAuth = getTokenAuth();
+  if (!widgetId || !tokenAuth) {
+    return {
+      ok: false,
+      enabled: false,
+      captcha: false,
+      otpLength: null,
+      error: 'MSG91 widgetId / tokenAuth are not configured',
+    };
+  }
+  try {
+    const res = await fetchWithTimeout(
+      `https://control.msg91.com/api/v5/widget/getWidgetProcess?widgetId=${encodeURIComponent(widgetId)}`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          tokenAuth,
+        },
+      },
+    );
+    const json = await res.json();
+    const data = json?.data ?? json;
+    const enabled = data?.status?.value === '1' || json?.status === 'success';
+    return {
+      ok: res.ok && enabled,
+      enabled,
+      captcha: Boolean(data?.captchaValidations),
+      otpLength: typeof data?.otpLength === 'number' ? data.otpLength : null,
+      error: enabled ? undefined : json?.message ?? `Widget check failed (HTTP ${res.status})`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      enabled: false,
+      captcha: false,
+      otpLength: null,
+      error: `MSG91 widget check failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 };
 
 /** The stored template ID must be the plain ID from the dashboard, not hex text. */
@@ -158,49 +218,6 @@ export const isValidIndianMobile = (phone: string): boolean =>
 
 /** Base URL for MSG91 v5 OTP endpoints — useful for diagnostics. */
 export const MSG91_BASE_URL = 'https://control.msg91.com/api/v5/otp';
-/** Base URL for the OTP Widget product (widgetId + tokenAuth). */
-export const MSG91_WIDGET_BASE_URL = 'https://api.msg91.com/api/v5/widget';
-
-/** Widget verification needs the reqId returned by send/retry. */
-const widgetReqIds = new Map<string, string>();
-
-const widgetHeaders = (authKey: string): Record<string, string> => ({
-  'Content-Type': 'application/json',
-  accept: 'application/json',
-  authkey: authKey,
-});
-
-/** tokenAuth can be sent in the body instead of the authkey header. */
-const widgetAuth = (authKey: string) => ({ tokenAuth: authKey });
-
-function isMsg91Success(json: any): boolean {
-  return (
-    json?.type === 'success' ||
-    json?.status === 'success' ||
-    Boolean(json?.['access-token'] || json?.access_token)
-  );
-}
-
-async function callWidget(
-  path: string,
-  authKey: string,
-  body: Record<string, unknown>,
-): Promise<{ ok: boolean; status: number; json: any }> {
-  const res = await fetchWithTimeout(`${MSG91_WIDGET_BASE_URL}/${path}`, {
-    method: 'POST',
-    headers: widgetHeaders(authKey),
-    body: JSON.stringify({ ...widgetAuth(authKey), ...body }),
-  });
-  const text = await res.text().catch(() => '');
-  let json: any = {};
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { message: text };
-  }
-  return { ok: res.ok, status: res.status, json };
-}
-
 function extractReqId(json: any): string | undefined {
   const direct = json?.reqId || json?.request_id || json?.requestId;
   if (typeof direct === 'string' && direct.length > 0) return direct;
@@ -211,45 +228,26 @@ function extractReqId(json: any): string | undefined {
   return undefined;
 }
 
-async function sendWidgetOtp(cleaned: string, authKey: string): Promise<SendOtpResult> {
-  const widgetId = getWidgetId() as string;
+/** The SDK handles captcha, request IDs and channels for widget mode. */
+async function sendWidgetOtp(cleaned: string): Promise<SendOtpResult> {
   try {
-    const { ok, status, json } = await callWidget('sendOtp', authKey, {
-      widgetId,
-      identifier: `91${cleaned}`,
-    });
-    const reqId = extractReqId(json);
-    if (!ok || (!isMsg91Success(json) && !reqId)) {
-      const detail = json?.message || json?.error || `HTTP ${status}`;
-      console.error('[MSG91 Widget Send]', detail);
-      const friendly = /widget disabled/i.test(detail)
-        ? 'MSG91 OTP Widget is disabled. Enable it in the MSG91 dashboard, or switch to classic OTP with a real template ID.'
-        : /captcha/i.test(detail)
-          ? 'MSG91 widget requires a captcha token. Disable captcha for this widget in the MSG91 dashboard, then retry.'
-          : `MSG91: ${detail}`;
-      return {
-        success: false,
-        isLiveMsg91: true,
-        messageEn: friendly,
-        messageTe: friendly,
-      };
-    }
-    if (reqId) widgetReqIds.set(cleaned, reqId);
-    console.log(`[MSG91 Widget] OTP dispatched to ${cleaned}, reqId: ${reqId || 'n/a'}`);
+    const data = await msg91WidgetBridge.call('sendOtp', { identifier: `91${cleaned}` });
+    console.log('[MSG91 Widget] OTP dispatched', data);
     return {
       success: true,
       isLiveMsg91: true,
-      requestId: reqId,
+      requestId: extractReqId(data),
       messageEn: `OTP sent via SMS to +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)}. Enter the ${OTP_LENGTH}-digit code below.`,
       messageTe: `OTP MSG91 SMS ద్వారా +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)} కు పంపబడింది. క్రింద 4 అంకెల కోడ నమోదు చేయండి.`,
     };
   } catch (error) {
-    console.error('[MSG91 Widget Send] Request failed:', error);
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error('[MSG91 Widget Send]', detail);
     return {
       success: false,
       isLiveMsg91: true,
-      messageEn: 'Network error sending OTP. Check your internet connection.',
-      messageTe: 'OTP పంపడం లో నిట్వర్క్ లోపం. మీ ఇంటర్నెట్ కనెక్షన్ తనిఖీ చేయండీ.',
+      messageEn: `MSG91: ${detail}`,
+      messageTe: `MSG91: ${detail}`,
     };
   }
 }
@@ -279,13 +277,18 @@ export const sendMsg91Otp = async (
     return {
       success: true,
       isLiveMsg91: false,
-      messageEn: `Sandbox mode — OTP: ${SANDBOX_OTP} (Dev only. Set EXPO_PUBLIC_MSG91_AUTH_KEY in .env to enable live MSG91 SMS/Voice OTP.)`,
-      messageTe: `సాండ్‌బాక్స్ మోడ్ — OTP: ${SANDBOX_OTP} (కేవలం డెవ్. లైవ్ MSG91 SMS/వాయ్స్ OTP సక్రమీకరించడం కోసం .env లో EXPO_PUBLIC_MSG91_AUTH_KEY జోడించండి.)`,
+      messageEn: `Sandbox mode — OTP: ${SANDBOX_OTP} (Dev only. Set EXPO_PUBLIC_MSG91_WIDGET_ID and EXPO_PUBLIC_MSG91_TOKEN_AUTH in .env to enable live MSG91 OTP.)`,
+      messageTe: `సాండ్‌బాక్స్ మోడ్ — OTP: ${SANDBOX_OTP} (కేవలం డెవ్. లైవ్ MSG91 OTP కోసం .env లో EXPO_PUBLIC_MSG91_WIDGET_ID, EXPO_PUBLIC_MSG91_TOKEN_AUTH జోడించండి.)`,
     };
   }
 
   const authKey = (isMsg91WidgetMode() ? getTokenAuth() : getAuthKey()) as string;
   const templateId = getTemplateId() as string;
+
+  // Widget mode goes through the official JS SDK (captcha + reqId handled there).
+  if (isMsg91WidgetMode()) {
+    return sendWidgetOtp(cleaned);
+  }
 
   if (looksLikeHexEncodedTemplateId(templateId)) {
     console.warn(
@@ -293,8 +296,7 @@ export const sendMsg91Otp = async (
     );
   }
 
-  // Fail loudly when the wallet is empty instead of making the farmer wait for
-  // an OTP that can never be dispatched.
+  // Classic mode only: a zero wallet stops every send, so fail loudly.
   const balance = await getMsg91Balance(1);
   if (balance.ok && balance.balance === 0) {
     return {
@@ -303,10 +305,6 @@ export const sendMsg91Otp = async (
       messageEn: 'MSG91 SMS wallet balance is 0. Recharge your MSG91 account, then try again.',
       messageTe: 'MSG91 SMS బ్యాలెన్స్ 0 గా ఉంది. దయచేసి మీ MSG91 ఖాతాను రీఛార్జ్ చేసి మళ్ళీ ప్రయత్నించండి.',
     };
-  }
-
-  if (isMsg91WidgetMode()) {
-    return sendWidgetOtp(cleaned, authKey);
   }
 
   try {
@@ -370,45 +368,21 @@ export const sendMsg91Otp = async (
   }
 };
 
-async function verifyWidgetOtp(
-  cleaned: string,
-  otpCode: string,
-  authKey: string,
-): Promise<VerifyOtpResult> {
-  const widgetId = getWidgetId() as string;
-  const reqId = widgetReqIds.get(cleaned);
-  if (!reqId) {
-    return {
-      success: false,
-      messageEn: 'Session expired — tap Get OTP again before verifying.',
-      messageTe: 'సెషన్ గడువు ముగిసింది — ధృవీకరణకు ముందు మళ్ళీ OTP పొందండి.',
-    };
-  }
+async function verifyWidgetOtp(otpCode: string): Promise<VerifyOtpResult> {
   try {
-    const { ok, status, json } = await callWidget('verifyOtp', authKey, {
-      widgetId,
-      reqId,
-      otp: otpCode,
-    });
-    if (ok && isMsg91Success(json)) {
-      widgetReqIds.delete(cleaned);
-      return {
-        success: true,
-        messageEn: 'Login successful! Welcome to RythuVaani.',
-        messageTe: 'లాగింపూ సఫలమైంది! రైతావాణికీ స్వార్గతం.',
-      };
-    }
+    await msg91WidgetBridge.call('verifyOtp', { otp: otpCode });
     return {
-      success: false,
-      messageEn: json?.message ?? `OTP verification failed (HTTP ${status}).`,
-      messageTe: json?.message ?? 'OTP ధృవీకరణ విఫలమైంది.',
+      success: true,
+      messageEn: 'Login successful! Welcome to RythuVaani.',
+      messageTe: 'లాగింపూ సఫలమైంది! రైతావాణికీ స్వార్గతం.',
     };
   } catch (error) {
-    console.error('[MSG91 Widget Verify] Request failed:', error);
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error('[MSG91 Widget Verify]', detail);
     return {
       success: false,
-      messageEn: 'Network error during verification. Check your internet.',
-      messageTe: 'ధృవీకరణ సమయంలో నిట్వర్క్ లోపం. మీ ఇంటర్నెట్ తనిఖీ చేయండి.',
+      messageEn: `OTP verification failed: ${detail}`,
+      messageTe: `OTP ధృవీకరణ విఫలమైంది: ${detail}`,
     };
   }
 }
@@ -416,43 +390,22 @@ async function verifyWidgetOtp(
 async function resendWidgetOtp(
   cleaned: string,
   channel: 'text' | 'voice',
-  authKey: string,
 ): Promise<ResendOtpResult> {
-  const widgetId = getWidgetId() as string;
-  const reqId = widgetReqIds.get(cleaned);
-  if (!reqId) {
-    return {
-      success: false,
-      messageEn: 'Session expired — tap Get OTP again.',
-      messageTe: 'సెషన్ గడువు ముగిసింది — మళ్ళీ OTP పొందండి.',
-    };
-  }
   try {
-    const { ok, status, json } = await callWidget('retryOtp', authKey, {
-      widgetId,
-      reqId,
-      retryChannel: channel === 'voice' ? 'voice' : 'sms',
-    });
-    if (ok && (isMsg91Success(json) || Boolean(json?.reqId))) {
-      const nextReqId = extractReqId(json);
-      if (nextReqId) widgetReqIds.set(cleaned, nextReqId);
-      return {
-        success: true,
-        messageEn: `${channel === 'voice' ? 'Voice Call OTP' : 'SMS OTP'} resent to +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)}.`,
-        messageTe: `${channel === 'voice' ? 'వాయిస్ కాల్ OTP' : 'SMS OTP'} +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)} కు మళ్ళీ పంపబడింది.`,
-      };
-    }
+    // MSG91 widget channel codes: 11 = SMS, 4 = VOICE.
+    await msg91WidgetBridge.call('retryOtp', { channel: channel === 'voice' ? '4' : '11' });
     return {
-      success: false,
-      messageEn: json?.message ?? `Retry failed (HTTP ${status}).`,
-      messageTe: json?.message ?? 'మళ్ళీ పంపడం విఫలమైంది.',
+      success: true,
+      messageEn: `${channel === 'voice' ? 'Voice Call OTP' : 'SMS OTP'} resent to +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)}.`,
+      messageTe: `${channel === 'voice' ? 'వాయిస్ కాల్ OTP' : 'SMS OTP'} +91 ${cleaned.slice(0, 5)}•••${cleaned.slice(5)} కు మళ్ళీ పంపబడింది.`,
     };
   } catch (error) {
-    console.error('[MSG91 Widget Retry] Request failed:', error);
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error('[MSG91 Widget Retry]', detail);
     return {
       success: false,
-      messageEn: 'Network error during resend.',
-      messageTe: 'మళ్ళీ పంపే సమయంలో నిట్వర్క్ లోపం.',
+      messageEn: `Resend failed: ${detail}`,
+      messageTe: `మళ్ళీ పంపడం విఫలమైంది: ${detail}`,
     };
   }
 }
@@ -496,7 +449,7 @@ export const verifyMsg91Otp = async (
   const authKey = (isMsg91WidgetMode() ? getTokenAuth() : getAuthKey()) as string;
 
   if (isMsg91WidgetMode()) {
-    return verifyWidgetOtp(cleaned, otpCode, authKey);
+    return verifyWidgetOtp(otpCode);
   }
 
   try {
@@ -588,7 +541,7 @@ export const resendMsg91Otp = async (
   const authKey = (isMsg91WidgetMode() ? getTokenAuth() : getAuthKey()) as string;
 
   if (isMsg91WidgetMode()) {
-    return resendWidgetOtp(cleaned, channel, authKey);
+    return resendWidgetOtp(cleaned, channel);
   }
 
   try {

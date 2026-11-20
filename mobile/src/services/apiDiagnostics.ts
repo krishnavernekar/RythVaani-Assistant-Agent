@@ -8,6 +8,7 @@ import {
   getMsg91Balance,
   isMsg91WidgetMode,
   looksLikeHexEncodedTemplateId,
+  probeMsg91Widget,
 } from './msg91AuthService';
 
 const PROVIDER = (process.env.EXPO_PUBLIC_AI_PROVIDER || 'freellm').trim().toLowerCase();
@@ -46,6 +47,9 @@ export interface ApiStatus {
     smsBalance: number | null;
     voiceBalance: number | null;
     templateIdOk: boolean;
+    widgetEnabled?: boolean;
+    widgetCaptcha?: boolean;
+    widgetOtpLength?: number | null;
   };
 }
 
@@ -234,7 +238,7 @@ export async function testSarvamConnection(): Promise<{ connected: boolean; erro
   }
 }
 
-/** Check MSG91 credentials, template ID and wallet balance without sending an SMS. */
+/** Check MSG91 credentials without sending an SMS (widget config or classic wallet). */
 async function testMsg91Connection(): Promise<ApiStatus['msg91']> {
   const widgetMode = isMsg91WidgetMode();
   const configured = Boolean(MSG91_KEY && MSG91_TEMPLATE);
@@ -251,7 +255,26 @@ async function testMsg91Connection(): Promise<ApiStatus['msg91']> {
       smsBalance: null,
       voiceBalance: null,
       templateIdOk,
-      error: 'MSG91 auth key / template ID not configured',
+      error: widgetMode
+        ? 'MSG91 widgetId / tokenAuth are not configured'
+        : 'MSG91 auth key / template ID not configured',
+    };
+  }
+
+  if (widgetMode) {
+    const probe = await probeMsg91Widget();
+    return {
+      configured: true,
+      keyFormatOk: MSG91_KEY.length > 10,
+      connected: probe.ok,
+      mode: 'widget',
+      smsBalance: null,
+      voiceBalance: null,
+      templateIdOk,
+      widgetEnabled: probe.enabled,
+      widgetCaptcha: probe.captcha,
+      widgetOtpLength: probe.otpLength,
+      error: probe.error,
     };
   }
 
