@@ -12,7 +12,7 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import { File } from 'expo-file-system';
 import { Colors, spacing } from '../theme/tokens';
-import { useAppStore } from '../store/useAppStore';
+import { useAppStore, type ChatThreadMessage } from '../store/useAppStore';
 import { analyzeCropImage, AiResponse } from '../services/agronomyAiService';
 import { fetchWeather } from '../services/weatherService';
 import { playIndicVoice, SarvamLang } from '../services/sarvamVoiceService';
@@ -25,8 +25,47 @@ interface Props {
 
 type CropKind = 'paddy' | 'chilli';
 
+const scannerSavedId = (title: string): string =>
+  `scan-${title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+
+const scannerQuestion = (crop: CropKind) => ({
+  en: `Scan my ${crop} leaf and diagnose the problem`,
+  te: crop === 'paddy' ? 'వరి ఆకును స్కాన్ చేసి రోగాన్ని గుర్తించండి' : 'మిరప ఆకును స్కాన్ చేసి రోగాన్ని గుర్తించండి',
+});
+
+const buildScannerChatThread = (
+  questionEn: string,
+  questionTe: string,
+  advisory: AiResponse,
+): ChatThreadMessage[] => {
+  const now = Date.now();
+  return [
+    { role: 'farmer', textEn: questionEn, textTe: questionTe, timestamp: now },
+    {
+      role: 'ai',
+      textEn: [
+        advisory.diagnosis_title_en,
+        advisory.advisory_en,
+        advisory.chemical_dosage_en,
+        advisory.weather_warning_en,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      textTe: [
+        advisory.diagnosis_title_te,
+        advisory.advisory_te,
+        advisory.chemical_dosage_te,
+        advisory.weather_warning_te,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      timestamp: now + 1,
+    },
+  ];
+};
+
 export function CropScannerModal({ visible, onClose }: Props) {
-  const { language } = useAppStore();
+  const { language, addQuestion, toggleSavedItem, savedItems } = useAppStore();
   const isTe = language === 'te';
   const sarvamLang: SarvamLang =
     language === 'en' ? 'en-IN' : language === 'hi' ? 'hi-IN' : 'te-IN';
@@ -70,14 +109,77 @@ export function CropScannerModal({ visible, onClose }: Props) {
       const file = new File(image);
       const base64Image = await file.base64();
       const weather = await fetchWeather();
-      const result = await analyzeCropImage(base64Image, weather);
-      setAdvisory({ ...result, diagnosis_title_en: `[${crop === 'paddy' ? 'Paddy' : 'Chilli'}] ${result.diagnosis_title_en}` });
+      const rawResult = await analyzeCropImage(base64Image, weather);
+      const result: AiResponse = {
+        ...rawResult,
+        diagnosis_title_en: `[${crop === 'paddy' ? 'Paddy' : 'Chilli'}] ${rawResult.diagnosis_title_en}`,
+      };
+      setAdvisory(result);
+
+      const question = scannerQuestion(crop);
+      addQuestion({
+        id: `scan-${Date.now()}`,
+        questionEn: question.en,
+        questionTe: question.te,
+        questionText: question.en,
+        answerTitle: result.diagnosis_title_en,
+        diagnosisEn: result.diagnosis_title_en,
+        diagnosisTe: result.diagnosis_title_te,
+        fullResponseEn: result.advisory_en,
+        fullResponseTe: result.advisory_te,
+        chemicalDosageEn: result.chemical_dosage_en,
+        chemicalDosageTe: result.chemical_dosage_te,
+        weatherWarningEn: result.weather_warning_en,
+        weatherWarningTe: result.weather_warning_te,
+        chatThread: buildScannerChatThread(question.en, question.te, result),
+        queryType: 'IMAGE_SCAN',
+        askedAt: new Date().toISOString(),
+        source: 'crop-scanner',
+      });
     } catch (e) {
       console.error('[CropScanner] Analysis failed:', e);
     } finally {
       setLoading(false);
     }
   };
+
+  const saveAdvisory = () => {
+    if (!advisory) return;
+    const question = scannerQuestion(crop);
+    const savedAt = Date.now();
+    toggleSavedItem({
+      id: scannerSavedId(advisory.diagnosis_title_en),
+      type: 'advisory',
+      category: 'advisory',
+      title: advisory.diagnosis_title_en,
+      titleTe: advisory.diagnosis_title_te,
+      subtitle: advisory.chemical_dosage_en,
+      questionEn: question.en,
+      questionTe: question.te,
+      diagnosisEn: advisory.diagnosis_title_en,
+      diagnosisTe: advisory.diagnosis_title_te,
+      fullResponseEn: advisory.advisory_en,
+      fullResponseTe: advisory.advisory_te,
+      chemicalDosageEn: advisory.chemical_dosage_en,
+      chemicalDosageTe: advisory.chemical_dosage_te,
+      weatherWarningEn: advisory.weather_warning_en,
+      weatherWarningTe: advisory.weather_warning_te,
+      chatThread: buildScannerChatThread(question.en, question.te, advisory),
+      data: {
+        advisory_en: advisory.advisory_en,
+        advisory_te: advisory.advisory_te,
+        chemical_dosage_en: advisory.chemical_dosage_en,
+        chemical_dosage_te: advisory.chemical_dosage_te,
+        weather_warning_en: advisory.weather_warning_en,
+        weather_warning_te: advisory.weather_warning_te,
+      },
+      bookmarkedAt: savedAt,
+      savedAt,
+    });
+  };
+
+  const isSaved =
+    !!advisory && savedItems.some((item) => item.id === scannerSavedId(advisory.diagnosis_title_en));
 
   const listenToAdvice = () => {
     if (!advisory) return;
@@ -160,6 +262,11 @@ export function CropScannerModal({ visible, onClose }: Props) {
                 <TouchableOpacity style={styles.listenBtn} onPress={listenToAdvice}>
                   <Text style={styles.footerBtnText}>🔊 వినండి / Listen</Text>
                 </TouchableOpacity>
+                <TouchableOpacity style={styles.listenBtn} onPress={saveAdvisory}>
+                  <Text style={styles.footerBtnText}>
+                    {isSaved ? '🔖 Saved' : '🔖 Save Advisory'}
+                  </Text>
+                </TouchableOpacity>
               </View>
             </View>
           )}
@@ -197,7 +304,7 @@ const styles = StyleSheet.create({
   diagnosis: { fontSize: 16, fontWeight: '900', color: Colors.primary, marginBottom: 6, marginTop: 4 },
   recBody: { fontSize: 13, lineHeight: 20, color: Colors.slate },
   dosage: { fontSize: 13, fontWeight: '700', color: Colors.ink, marginTop: spacing.sm, lineHeight: 20 },
-  footerRow: { flexDirection: 'row', marginTop: spacing.md },
+  footerRow: { flexDirection: 'row', marginTop: spacing.md, gap: spacing.sm },
   listenBtn: { flex: 1, backgroundColor: Colors.primarySoft, padding: spacing.sm, borderRadius: 10, alignItems: 'center' },
   footerBtnText: { fontSize: 12, fontWeight: '800', color: Colors.primary },
   closeBtn: { padding: spacing.sm, alignItems: 'center' },

@@ -22,6 +22,12 @@ export default function HomeDashboardScreen() {
   const { language, farmer } = useAppStore();
   const dict = getDict(language);
   const isTe = language === 'te';
+  const farmerName =
+    (isTe ? farmer.nameTe ?? farmer.nameEn ?? farmer.name : farmer.nameEn ?? farmer.name) ||
+    (isTe ? 'రైతు' : 'Farmer');
+  const farmerMandal = isTe
+    ? farmer.mandalTe || farmer.mandal
+    : farmer.mandal || farmer.district;
 
   const [weatherData, setWeatherData] = useState<WeatherData>(FALLBACK_WEATHER);
   const [refreshing, setRefreshing] = useState(false);
@@ -79,7 +85,10 @@ export default function HomeDashboardScreen() {
                 {dict.home.greetingPrefix}{' '}
                 <Text style={styles.kharifBadge}>{dict.home.kharifBadge}</Text>
               </Text>
-              <Text style={styles.farmerName}>{farmer.name}</Text>
+              <Text style={styles.farmerName}>{farmerName}</Text>
+              {farmerMandal ? (
+                <Text style={styles.farmerMandal}>📍 {farmerMandal}</Text>
+              ) : null}
             </View>
             <TouchableOpacity
               style={styles.askAiFab}
@@ -286,6 +295,12 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     color: Colors.primary,
     marginTop: 2,
+  },
+  farmerMandal: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: Colors.slate,
+    marginTop: 3,
   },
   askAiFab: {
     width: 40,

@@ -15,21 +15,61 @@ import type { FarmerProfile, SavedItem, Language } from '../store/useAppStore';
 
 export type CloudSyncStatus = 'offline' | 'syncing' | 'synced';
 
+export interface ChatThreadMessage {
+  role: 'farmer' | 'ai';
+  textEn: string;
+  textTe: string;
+  timestamp: number;
+}
+
 export interface QuestionRecord {
   id?: string;
+  /** Legacy field kept so old persisted history still renders. */
   questionText?: string;
-  questionTe?: string;
+  questionEn: string;
+  questionTe: string;
+  /** Legacy field kept so old persisted history still renders. */
   answerTitle?: string;
+  titleEn?: string;
+  titleTe?: string;
+  diagnosisEn?: string;
+  diagnosisTe?: string;
+  fullResponseEn: string;
+  fullResponseTe: string;
+  chemicalDosageEn?: string;
+  chemicalDosageTe?: string;
+  weatherWarningEn?: string;
+  weatherWarningTe?: string;
+  chatThread?: ChatThreadMessage[];
+  queryType?: string;
   askedAt?: string;
+  savedAt?: number;
   source?: string;
 }
 
-export interface SyncFarmerResult {
-  profile: FarmerProfile;
-  savedItems?: SavedItem[];
-  questionHistory?: QuestionRecord[];
-  isRestoredFromCloud: boolean;
+export interface SchemeCheckSnapshot {
+  wizardInputs: Record<string, unknown>;
+  checkedDocuments: string[];
+  eligibleCount: number;
 }
+
+export interface CloudSyncState {
+  farmer: FarmerProfile;
+  language: Language;
+  savedItems: SavedItem[];
+  questionHistory: QuestionRecord[];
+  schemeCheck?: SchemeCheckSnapshot;
+}
+
+export type SyncFarmerResult =
+  | {
+      isExistingUser: true;
+      profile: FarmerProfile;
+      preferredLanguage: Language;
+      savedItems: SavedItem[];
+      questionHistory: QuestionRecord[];
+    }
+  | { isExistingUser: false };
 
 /* ──────────────────────────── Config ──────────────────────────────────── */
 
@@ -48,11 +88,20 @@ export const isCloudDbConfigured = (): boolean =>
 
 /* ──────────────────────────── Helpers ─────────────────────────────────── */
 
-const cleanPhone10 = (phone: string): string =>
-  phone.replace(/[\s\-+]/g, '').replace(/^91/, '').slice(-10);
+/** Strip formatting, remove a leading country code and return exactly 10 digits. */
+export const normalizeFarmerPhone = (rawPhone?: string): string => {
+  const stripped = (rawPhone ?? '').replace(/[\s\-()]/g, '');
+  const withoutCountry = stripped.replace(/^\+?91/, '');
+  const digits = withoutCountry.replace(/\D/g, '').slice(-10);
+  return `+91${digits.length === 10 ? digits : '9848054321'}`;
+};
 
+/** Backwards-compatible alias used by the existing store call sites. */
 export const normalizePhone = (phone: string): string =>
-  `+91${cleanPhone10(phone)}`;
+  normalizeFarmerPhone(phone);
+
+const toLanguage = (value?: string): Language =>
+  value === 'en' || value === 'hi' ? value : 'te';
 
 const headers = (extra?: Record<string, string>): Record<string, string> => {
   const key = getSupabaseAnonKey() ?? '';
@@ -78,6 +127,243 @@ const safeFetch = async (
   }
 };
 
+const toIso = (value?: string | number): string => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return new Date(value).toISOString();
+  }
+  if (typeof value === 'string' && value.length > 0) {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return new Date().toISOString();
+};
+
+const stripPhonePrefix = (id: string, phone: string): string =>
+  id.startsWith(`${phone}_`) ? id.slice(phone.length + 1) : id;
+
+const parseCrops = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.filter((crop) => typeof crop === 'string').map(String);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((crop) => crop.trim())
+      .filter(Boolean);
+  }
+  return ['Chilli', 'Paddy'];
+};
+
+const acreageLabelFor = (acres: number): string => {
+  if (acres <= 2) return 'Small/Marginal';
+  if (acres <= 5) return 'Small';
+  if (acres <= 10) return 'Medium';
+  return 'Large';
+};
+
+const mandalTeFor = (mandal: string): string => {
+  const map: Record<string, string> = {
+    'Guntur Mandal': 'గుంటూరు మండలం',
+    'Tenali Mandal': 'తెనాలి మండలం',
+    Mangalagiri: 'మంగళగిరి',
+    Bapatla: 'బాపట్ల',
+    Vijayawada: 'విజయవాడ',
+  };
+  return map[mandal] ?? mandal;
+};
+
+const cropTeFor = (crops: string[]): string[] => {
+  const map: Record<string, string> = {
+    Chilli: 'మిర్చి',
+    Paddy: 'వరి',
+    Cotton: 'పత్తి',
+    Pulses: 'పప్పుధాన్యాలు',
+    Turmeric: 'పసుపు',
+  };
+  return crops.map((crop) => map[crop] ?? crop);
+};
+
+/** public.farmers has no address column, so keep it inside `mandal`. */
+const foldAddressIntoMandal = (address?: string, mandal?: string): string => {
+  const cleanAddress = address?.trim() ?? '';
+  const cleanMandal = mandal?.trim() ?? '';
+  if (!cleanAddress) return cleanMandal;
+  if (!cleanMandal) return cleanAddress;
+  return `${cleanAddress}, ${cleanMandal}`;
+};
+
+const splitAddressFromMandal = (
+  mandal: string,
+): { address?: string; mandal: string } => {
+  const parts = mandal
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length < 2) return { mandal };
+  return {
+    address: parts.slice(0, -1).join(', '),
+    mandal: parts[parts.length - 1],
+  };
+};
+
+/* ──────────────── Lossless full-conversation payload packing ─────────── */
+
+interface PackedConversation {
+  questionEn: string;
+  questionTe: string;
+  diagnosisEn: string;
+  diagnosisTe: string;
+  fullResponseEn: string;
+  fullResponseTe: string;
+  chemicalDosageEn: string;
+  chemicalDosageTe: string;
+  weatherWarningEn: string;
+  weatherWarningTe: string;
+  chatThread?: ChatThreadMessage[];
+}
+
+const FULL_PAYLOAD_MARKER = '[[RV_FULL_V1]]';
+
+const packFullText = (readable: string, payload: PackedConversation): string =>
+  `${readable}\n\n${FULL_PAYLOAD_MARKER}${JSON.stringify(payload)}`;
+
+const unpackFullText = (
+  value?: string | null,
+): { readable: string; payload?: Partial<PackedConversation> } => {
+  const raw = value ?? '';
+  const markerIndex = raw.indexOf(FULL_PAYLOAD_MARKER);
+  if (markerIndex < 0) return { readable: raw };
+  const readable = raw.slice(0, markerIndex).trim();
+  try {
+    const parsed = JSON.parse(raw.slice(markerIndex + FULL_PAYLOAD_MARKER.length));
+    return {
+      readable,
+      payload: parsed && typeof parsed === 'object' ? parsed : undefined,
+    };
+  } catch {
+    return { readable };
+  }
+};
+
+const formatChatText = (
+  thread: ChatThreadMessage[] | undefined,
+  isTe: boolean,
+): string => {
+  if (!thread || thread.length === 0) return '';
+  return thread
+    .map((message) => {
+      const speaker = message.role === 'farmer'
+        ? (isTe ? 'రైతు' : 'Farmer')
+        : (isTe ? 'AI సలహాదారుడు' : 'AI Advisor');
+      const text = isTe ? message.textTe || message.textEn : message.textEn || message.textTe;
+      return `${speaker}: ${text}`;
+    })
+    .join('\n');
+};
+
+const buildSavedReadableText = (
+  item: SavedItem,
+  isTe: boolean,
+): string => {
+  const labels = isTe
+    ? {
+        question: 'ప్రశ్న',
+        diagnosis: 'నిర్ధారణ',
+        response: 'AI సలహా',
+        dosage: 'మోతాదు / ప్రయోజనం',
+        warning: 'హెచ్చరిక / తదుపరి చర్య',
+        chat: 'సంభాషణ',
+      }
+    : {
+        question: 'Question',
+        diagnosis: 'Diagnosis',
+        response: 'AI Response',
+        dosage: 'Dosage / Benefit',
+        warning: 'Warning / Next Action',
+        chat: 'Chat Thread',
+      };
+  const question = isTe ? item.questionTe : item.questionEn;
+  const diagnosis = isTe ? item.diagnosisTe : item.diagnosisEn;
+  const response = isTe ? item.fullResponseTe : item.fullResponseEn;
+  const dosage = isTe ? item.chemicalDosageTe : item.chemicalDosageEn;
+  const warning = isTe ? item.weatherWarningTe : item.weatherWarningEn;
+
+  return [
+    question ? `${labels.question}: ${question}` : '',
+    diagnosis ? `${labels.diagnosis}: ${diagnosis}` : '',
+    response ? `${labels.response}: ${response}` : '',
+    dosage ? `${labels.dosage}: ${dosage}` : '',
+    warning ? `${labels.warning}: ${warning}` : '',
+    formatChatText(item.chatThread, isTe)
+      ? `${labels.chat}:\n${formatChatText(item.chatThread, isTe)}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+};
+
+const buildQuestionReadableText = (
+  question: QuestionRecord,
+  isTe: boolean,
+): string => {
+  const labels = isTe
+    ? {
+        response: 'AI సలహా',
+        dosage: 'మోతాదు / ప్రయోజనం',
+        warning: 'హెచ్చరిక / తదుపరి చర్య',
+        chat: 'సంభాషణ',
+      }
+    : {
+        response: 'AI Response',
+        dosage: 'Dosage / Benefit',
+        warning: 'Warning / Next Action',
+        chat: 'Chat Thread',
+      };
+  const response = isTe ? question.fullResponseTe : question.fullResponseEn;
+  const dosage = isTe ? question.chemicalDosageTe : question.chemicalDosageEn;
+  const warning = isTe ? question.weatherWarningTe : question.weatherWarningEn;
+  const chat = formatChatText(question.chatThread, isTe);
+
+  return [
+    response ? `${labels.response}: ${response}` : '',
+    dosage ? `${labels.dosage}: ${dosage}` : '',
+    warning ? `${labels.warning}: ${warning}` : '',
+    chat ? `${labels.chat}:\n${chat}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+};
+
+const conversationPayloadFromSaved = (item: SavedItem): PackedConversation => ({
+  questionEn: item.questionEn ?? '',
+  questionTe: item.questionTe ?? '',
+  diagnosisEn: item.diagnosisEn ?? item.title ?? '',
+  diagnosisTe: item.diagnosisTe ?? item.titleTe ?? item.title ?? '',
+  fullResponseEn: item.fullResponseEn ?? '',
+  fullResponseTe: item.fullResponseTe ?? '',
+  chemicalDosageEn: item.chemicalDosageEn ?? item.badgeEn ?? '',
+  chemicalDosageTe: item.chemicalDosageTe ?? item.badgeTe ?? '',
+  weatherWarningEn: item.weatherWarningEn ?? '',
+  weatherWarningTe: item.weatherWarningTe ?? '',
+  chatThread: item.chatThread,
+});
+
+const conversationPayloadFromQuestion = (
+  question: QuestionRecord,
+): PackedConversation => ({
+  questionEn: question.questionEn ?? question.questionText ?? '',
+  questionTe: question.questionTe ?? question.questionText ?? '',
+  diagnosisEn: question.diagnosisEn ?? question.titleEn ?? question.answerTitle ?? '',
+  diagnosisTe: question.diagnosisTe ?? question.titleTe ?? question.answerTitle ?? '',
+  fullResponseEn: question.fullResponseEn ?? '',
+  fullResponseTe: question.fullResponseTe ?? '',
+  chemicalDosageEn: question.chemicalDosageEn ?? '',
+  chemicalDosageTe: question.chemicalDosageTe ?? '',
+  weatherWarningEn: question.weatherWarningEn ?? '',
+  weatherWarningTe: question.weatherWarningTe ?? '',
+  chatThread: question.chatThread,
+});
+
 /* ──────────────────────────── Farmer sync ──────────────────────────────── */
 
 interface DbFarmerRow {
@@ -86,181 +372,229 @@ interface DbFarmerRow {
   name_te?: string;
   acres?: number;
   mandal?: string;
-  mandal_te?: string;
   district?: string;
   state?: string;
-  category?: string;
-  crops?: string[];
-  crops_te?: string[];
-  ownership?: string;
+  ownership_type?: string;
+  primary_crops?: string[] | string;
   preferred_language?: string;
-  acreage_label?: string;
 }
 
 interface DbSavedItemRow {
   id?: string;
-  item_id: string;
-  type: 'scheme' | 'advisory';
-  title: string;
-  title_te: string;
-  subtitle?: string;
-  data?: Record<string, unknown>;
+  farmer_phone?: string;
+  item_id?: string;
+  item_type?: string;
+  title_en?: string;
+  title_te?: string;
+  subtitle_en?: string;
+  subtitle_te?: string;
+  benefit_or_dosage?: string | null;
   saved_at?: string;
 }
 
 interface DbQuestionRow {
   id?: string;
-  question_text?: string;
+  farmer_phone?: string;
+  query_type?: string;
+  question_en?: string;
   question_te?: string;
-  answer_title?: string;
+  diagnosis_en?: string;
+  diagnosis_te?: string;
+  advisory_en?: string;
+  advisory_te?: string;
   asked_at?: string;
-  source?: string;
 }
 
-const rowToFarmer = (row: DbFarmerRow): FarmerProfile => ({
-  name: row.name_en ?? 'Venkata Reddy Garu',
-  nameTe: row.name_te ?? 'వెంకట రెడ్డి గారు',
-  phoneMasked: row.phone,
-  acres: row.acres ?? 4.5,
-  acreageLabel: row.acreage_label ?? 'Small/Marginal',
-  mandal: row.mandal ?? 'Guntur Mandal',
-  mandalTe: row.mandal_te ?? 'గుంటూరు మండలం',
-  district: row.district ?? 'Guntur',
-  state: row.state ?? 'Andhra Pradesh',
-  category: (row.category === 'Tenant' ? 'Tenant' : 'Pattadar') as
-    | 'Pattadar'
-    | 'Tenant',
-  crops: row.crops ?? ['Chilli', 'Paddy'],
-  cropsTe: row.crops_te ?? ['మిర్చి', 'వరి'],
-});
+const rowToFarmer = (row: DbFarmerRow): FarmerProfile => {
+  const combinedMandal = row.mandal ?? '';
+  const splitMandal = splitAddressFromMandal(combinedMandal);
+  const nameEn = row.name_en ?? 'Venkata Reddy Garu';
+  const crops = parseCrops(row.primary_crops);
+  const acres = row.acres ?? 4.5;
+  const phone = normalizeFarmerPhone(row.phone);
 
-const rowToSavedItem = (row: DbSavedItemRow): SavedItem => ({
-  id: row.item_id,
-  type: row.type,
-  title: row.title,
-  titleTe: row.title_te,
-  subtitle: row.subtitle,
-  data: row.data,
-  bookmarkedAt: row.saved_at ? new Date(row.saved_at).getTime() : Date.now(),
-});
+  return {
+    name: nameEn,
+    nameEn,
+    nameTe: row.name_te ?? nameEn,
+    phone,
+    phoneMasked: phone,
+    address: splitMandal.address,
+    acres,
+    acreageLabel: acreageLabelFor(acres),
+    mandal: splitMandal.mandal || 'Guntur Mandal',
+    mandalTe: mandalTeFor(splitMandal.mandal || 'Guntur Mandal'),
+    district: row.district ?? 'Guntur',
+    state: row.state ?? 'Andhra Pradesh',
+    category:
+      (row.ownership_type ?? '').toLowerCase() === 'tenant'
+        ? 'Tenant'
+        : 'Pattadar',
+    crops,
+    cropsTe: cropTeFor(crops),
+  };
+};
 
-const rowToQuestion = (row: DbQuestionRow): QuestionRecord => ({
-  id: row.id,
-  questionText: row.question_text,
-  questionTe: row.question_te,
-  answerTitle: row.answer_title,
-  askedAt: row.asked_at,
-  source: row.source,
-});
+const parseBenefitData = (
+  value?: string | null,
+): Record<string, unknown> | undefined => {
+  if (!value || !value.trim().startsWith('{')) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
+const rowToSavedItem = (row: DbSavedItemRow, phone: string): SavedItem => {
+  const english = unpackFullText(row.subtitle_en);
+  const telugu = unpackFullText(row.subtitle_te);
+  const payload = english.payload ?? telugu.payload;
+  const benefitData = parseBenefitData(row.benefit_or_dosage);
+  const benefitRaw = benefitData ? '' : row.benefit_or_dosage ?? '';
+  const savedAt = row.saved_at ? new Date(row.saved_at).getTime() : Date.now();
+  const itemType = row.item_type === 'advisory' ? 'advisory' : 'scheme';
+  const title = row.title_en ?? '';
+
+  return {
+    id: row.item_id || stripPhonePrefix(row.id ?? '', phone),
+    type: itemType,
+    category: itemType,
+    title,
+    titleTe: row.title_te || title,
+    subtitle: english.readable || telugu.readable || undefined,
+    questionEn: payload?.questionEn ?? '',
+    questionTe: payload?.questionTe ?? '',
+    diagnosisEn: payload?.diagnosisEn ?? title,
+    diagnosisTe: payload?.diagnosisTe ?? row.title_te ?? title,
+    fullResponseEn: payload?.fullResponseEn ?? english.readable,
+    fullResponseTe: payload?.fullResponseTe ?? (telugu.readable || english.readable),
+    chemicalDosageEn: payload?.chemicalDosageEn ?? benefitRaw,
+    chemicalDosageTe: payload?.chemicalDosageTe ?? benefitRaw,
+    weatherWarningEn: payload?.weatherWarningEn ?? '',
+    weatherWarningTe: payload?.weatherWarningTe ?? '',
+    chatThread: payload?.chatThread,
+    data: benefitData,
+    bookmarkedAt: savedAt,
+    savedAt,
+  };
+};
+
+const rowToQuestion = (row: DbQuestionRow, phone: string): QuestionRecord => {
+  const english = unpackFullText(row.advisory_en);
+  const telugu = unpackFullText(row.advisory_te);
+  const payload = english.payload ?? telugu.payload;
+  const questionEn = row.question_en ?? '';
+  const questionTe = row.question_te ?? '';
+  const diagnosisEn = row.diagnosis_en ?? '';
+  const diagnosisTe = row.diagnosis_te ?? diagnosisEn;
+
+  return {
+    id: stripPhonePrefix(row.id ?? '', phone),
+    questionText: questionEn,
+    questionEn: payload?.questionEn ?? questionEn,
+    questionTe: payload?.questionTe ?? questionTe,
+    answerTitle: diagnosisEn,
+    titleEn: diagnosisEn,
+    titleTe: diagnosisTe,
+    diagnosisEn: payload?.diagnosisEn ?? diagnosisEn,
+    diagnosisTe: payload?.diagnosisTe ?? diagnosisTe,
+    fullResponseEn: payload?.fullResponseEn ?? english.readable,
+    fullResponseTe: payload?.fullResponseTe ?? (telugu.readable || english.readable),
+    chemicalDosageEn: payload?.chemicalDosageEn ?? '',
+    chemicalDosageTe: payload?.chemicalDosageTe ?? '',
+    weatherWarningEn: payload?.weatherWarningEn ?? '',
+    weatherWarningTe: payload?.weatherWarningTe ?? '',
+    chatThread: payload?.chatThread,
+    queryType: row.query_type ?? 'VOICE',
+    askedAt: row.asked_at,
+    source: row.query_type ?? 'cloud',
+  };
+};
+
+/**
+ * Look up a phone in Supabase. A missing row means "brand new phone" — the
+ * store owns the empty-profile/onboarding behaviour in that case.
+ */
 export const syncFarmerOnLogin = async (
   phone: string,
-  currentProfile: FarmerProfile,
-  preferredLang: Language,
 ): Promise<SyncFarmerResult> => {
   const url = getSupabaseUrl();
   const key = getSupabaseAnonKey();
-  if (!url || !key) {
-    return {
-      profile: currentProfile,
-      isRestoredFromCloud: false,
-    };
-  }
+  if (!url || !key) return { isExistingUser: false };
 
-  const cleanPhone = cleanPhone10(phone);
-  const phoneE164 = `+91${cleanPhone}`;
+  const normalizedPhone = normalizeFarmerPhone(phone);
 
   try {
-    // 1. Check if farmer exists
     const checkRes = await safeFetch(
-      `${url}/rest/v1/farmers?phone=eq.${encodeURIComponent(phoneE164)}&select=*`,
+      `${url}/rest/v1/farmers?phone=eq.${encodeURIComponent(normalizedPhone)}&select=*`,
       { headers: headers() },
     );
 
-    if (!checkRes) {
-      return { profile: currentProfile, isRestoredFromCloud: false };
-    }
+    if (!checkRes || !checkRes.ok) return { isExistingUser: false };
 
     const existing = (await checkRes.json()) as DbFarmerRow[];
-    const hasExisting = Array.isArray(existing) && existing.length > 0;
-
-    if (hasExisting) {
-      const row = existing[0];
-      const profile = rowToFarmer(row);
-
-      // Fetch saved items
-      let savedItems: SavedItem[] = [];
-      const savedRes = await safeFetch(
-        `${url}/rest/v1/farmer_saved_items?farmer_phone=eq.${encodeURIComponent(phoneE164)}&order=saved_at.desc`,
-        { headers: headers() },
-      );
-      if (savedRes && savedRes.ok) {
-        const savedRows = (await savedRes.json()) as DbSavedItemRow[];
-        if (Array.isArray(savedRows)) {
-          savedItems = savedRows.map(rowToSavedItem);
-        }
-      }
-
-      // Fetch AI questions
-      let questionHistory: QuestionRecord[] = [];
-      const qRes = await safeFetch(
-        `${url}/rest/v1/farmer_ai_questions?farmer_phone=eq.${encodeURIComponent(phoneE164)}&order=asked_at.desc`,
-        { headers: headers() },
-      );
-      if (qRes && qRes.ok) {
-        const qRows = (await qRes.json()) as DbQuestionRow[];
-        if (Array.isArray(qRows)) {
-          questionHistory = qRows.map(rowToQuestion);
-        }
-      }
-
-      return {
-        profile,
-        savedItems,
-        questionHistory,
-        isRestoredFromCloud: true,
-      };
+    if (!Array.isArray(existing) || existing.length === 0) {
+      return { isExistingUser: false };
     }
 
-    // First-time login: upsert new record
-    const upsertBody = {
-      phone: phoneE164,
-      name_en: currentProfile.name,
-      name_te: currentProfile.nameTe,
-      acres: currentProfile.acres,
-      mandal: currentProfile.mandal,
-      mandal_te: currentProfile.mandalTe,
-      district: currentProfile.district,
-      state: currentProfile.state,
-      category: currentProfile.category,
-      crops: currentProfile.crops,
-      crops_te: currentProfile.cropsTe,
-      acreage_label: currentProfile.acreageLabel,
-      preferred_language: preferredLang,
-    };
+    const profile = rowToFarmer(existing[0]);
 
-    const upsertRes = await safeFetch(`${url}/rest/v1/farmers`, {
-      method: 'POST',
-      headers: headers({ Prefer: 'resolution=merge-duplicates,return=representation' }),
-      body: JSON.stringify(upsertBody),
-    });
+    let savedItems: SavedItem[] = [];
+    const savedRes = await safeFetch(
+      `${url}/rest/v1/farmer_saved_items?farmer_phone=eq.${encodeURIComponent(normalizedPhone)}&order=saved_at.desc`,
+      { headers: headers() },
+    );
+    if (savedRes && savedRes.ok) {
+      const savedRows = (await savedRes.json()) as DbSavedItemRow[];
+      if (Array.isArray(savedRows)) {
+        savedItems = savedRows.map((row) => rowToSavedItem(row, normalizedPhone));
+      }
+    }
 
-    if (upsertRes && upsertRes.ok) {
-      console.log('[DB] New farmer upserted to cloud');
+    let questionHistory: QuestionRecord[] = [];
+    const qRes = await safeFetch(
+      `${url}/rest/v1/farmer_ai_questions?farmer_phone=eq.${encodeURIComponent(normalizedPhone)}&order=asked_at.desc`,
+      { headers: headers() },
+    );
+    if (qRes && qRes.ok) {
+      const qRows = (await qRes.json()) as DbQuestionRow[];
+      if (Array.isArray(qRows)) {
+        questionHistory = qRows.map((row) => rowToQuestion(row, normalizedPhone));
+      }
     }
 
     return {
-      profile: currentProfile,
-      isRestoredFromCloud: false,
+      isExistingUser: true,
+      profile,
+      preferredLanguage: toLanguage(existing[0].preferred_language),
+      savedItems,
+      questionHistory,
     };
   } catch (error) {
     console.warn('[DB] syncFarmerOnLogin failed:', error);
-    return {
-      profile: currentProfile,
-      isRestoredFromCloud: false,
-    };
+    return { isExistingUser: false };
   }
 };
+
+const defaultProfileForPhone = (phone: string): FarmerProfile => ({
+  name: '',
+  nameEn: '',
+  nameTe: '',
+  phone,
+  phoneMasked: phone,
+  address: '',
+  acres: 0,
+  acreageLabel: 'Small/Marginal',
+  mandal: '',
+  mandalTe: '',
+  district: 'Guntur',
+  state: 'Andhra Pradesh',
+  category: 'Pattadar',
+  crops: [],
+  cropsTe: [],
+});
 
 export const upsertFarmerProfileToCloud = async (
   profile: FarmerProfile,
@@ -270,48 +604,159 @@ export const upsertFarmerProfileToCloud = async (
   const key = getSupabaseAnonKey();
   if (!url || !key) return false;
 
-  const phone = normalizePhone(profile.phoneMasked);
+  const phone = normalizeFarmerPhone(profile.phone ?? profile.phoneMasked);
+  const nameEn = profile.nameEn ?? profile.name ?? '';
+  const nameTe = profile.nameTe ?? nameEn;
+  const mandal = foldAddressIntoMandal(profile.address, profile.mandal);
+  const state = profile.state || 'Andhra Pradesh';
+  const district = profile.district || 'Guntur';
+  const acres = Number.isFinite(profile.acres) ? profile.acres : 0;
+  const crops = profile.crops ?? [];
+
+  // public.farmers columns: phone, name_en, name_te, preferred_language,
+  // state, district, mandal, acres, ownership_type, primary_crops.
+  // `address` is intentionally folded into mandal because that column
+  // does not exist in the deployed table.
+  const fullPayload = {
+    phone,
+    name_en: nameEn,
+    name_te: nameTe,
+    preferred_language: preferredLang,
+    state,
+    district,
+    mandal,
+    acres,
+    ownership_type:
+      profile.category === 'Tenant' ? 'TENANT' : 'PATTADAR',
+    primary_crops: crops,
+  };
+
+  const minimalPayload = {
+    phone,
+    name_en: nameEn,
+    name_te: nameTe,
+    preferred_language: preferredLang,
+    state,
+    district,
+    mandal,
+    acres,
+  };
 
   try {
-    const body = {
-      phone,
-      name_en: profile.name,
-      name_te: profile.nameTe,
-      acres: profile.acres,
-      mandal: profile.mandal,
-      mandal_te: profile.mandalTe,
-      district: profile.district,
-      state: profile.state,
-      category: profile.category,
-      crops: profile.crops,
-      crops_te: profile.cropsTe,
-      acreage_label: profile.acreageLabel,
-      preferred_language: preferredLang,
-    };
-
-    const res = await safeFetch(`${url}/rest/v1/farmers`, {
-      method: 'POST',
-      headers: headers({ Prefer: 'resolution=merge-duplicates,return=representation' }),
-      body: JSON.stringify(body),
-    });
-
-    return Boolean(res && res.ok);
+    for (const payload of [fullPayload, minimalPayload]) {
+      const res = await safeFetch(`${url}/rest/v1/farmers`, {
+        method: 'POST',
+        headers: headers({
+          Prefer: 'resolution=merge-duplicates,return=minimal',
+        }),
+        body: JSON.stringify(payload),
+      });
+      if (res && res.ok) return true;
+    }
+    return false;
   } catch (error) {
     console.warn('[DB] upsertFarmerProfileToCloud failed:', error);
     return false;
   }
 };
 
+/**
+ * Every child table has farmer_phone REFERENCES farmers(phone). Upsert the
+ * parent first so PostgreSQL can never reject a child row with FK 23503.
+ */
+const ensureParentFarmerExists = async (
+  phone: string,
+  profile?: FarmerProfile,
+  lang?: Language,
+): Promise<boolean> => {
+  const normalized = normalizeFarmerPhone(phone);
+  const parent = profile
+    ? { ...profile, phone: normalized, phoneMasked: normalized }
+    : defaultProfileForPhone(normalized);
+  return upsertFarmerProfileToCloud(parent, lang ?? 'te');
+};
+
+const upsertRow = async (
+  table: string,
+  body: Record<string, unknown>,
+  conflict: string,
+): Promise<boolean> => {
+  const url = getSupabaseUrl();
+  if (!url) return false;
+  const res = await safeFetch(
+    `${url}/rest/v1/${table}?on_conflict=${encodeURIComponent(conflict)}`,
+    {
+      method: 'POST',
+      headers: headers({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify(body),
+    },
+  );
+  return Boolean(res && res.ok);
+};
+
+const savedItemBody = (phone: string, item: SavedItem): Record<string, unknown> => {
+  const payload = conversationPayloadFromSaved(item);
+  const savedAt = item.savedAt ?? item.bookmarkedAt ?? Date.now();
+  return {
+    id: `${phone}_${item.id}`,
+    farmer_phone: phone,
+    item_id: item.id,
+    item_type: item.category ?? item.type,
+    title_en: item.title ?? '',
+    title_te: item.titleTe || item.title || '',
+    subtitle_en: packFullText(buildSavedReadableText(item, false), payload),
+    subtitle_te: packFullText(buildSavedReadableText(item, true), payload),
+    benefit_or_dosage: item.chemicalDosageEn || item.badgeEn || '',
+    saved_at: toIso(savedAt),
+  };
+};
+
+const questionBody = (
+  phone: string,
+  question: QuestionRecord,
+): Record<string, unknown> => {
+  const payload = conversationPayloadFromQuestion(question);
+  const id = question.id ?? `q-${Date.now()}`;
+  return {
+    id: `${phone}_${id}`,
+    farmer_phone: phone,
+    query_type: (question.queryType || 'VOICE').toUpperCase(),
+    question_en: question.questionEn ?? question.questionText ?? '',
+    question_te: question.questionTe ?? question.questionText ?? '',
+    diagnosis_en:
+      question.diagnosisEn ?? question.titleEn ?? question.answerTitle ?? '',
+    diagnosis_te:
+      question.diagnosisTe ?? question.titleTe ?? question.answerTitle ?? '',
+    advisory_en: packFullText(buildQuestionReadableText(question, false), payload),
+    advisory_te: packFullText(buildQuestionReadableText(question, true), payload),
+    asked_at: toIso(question.askedAt ?? question.savedAt),
+  };
+};
+
+const schemeCheckBody = (
+  phone: string,
+  snapshot: SchemeCheckSnapshot,
+): Record<string, unknown> => ({
+  farmer_phone: phone,
+  wizard_inputs: snapshot.wizardInputs ?? {},
+  checked_documents: snapshot.checkedDocuments ?? [],
+  eligible_count: Number.isFinite(snapshot.eligibleCount)
+    ? Math.round(snapshot.eligibleCount)
+    : 0,
+});
+
 export const syncSavedItemToCloud = async (
   farmerPhone: string,
   item: SavedItem,
   action: 'UPSERT' | 'DELETE',
+  profile?: FarmerProfile,
+  lang?: Language,
 ): Promise<boolean> => {
   const url = getSupabaseUrl();
   const key = getSupabaseAnonKey();
   if (!url || !key) return false;
 
-  const phone = normalizePhone(farmerPhone);
+  const phone = normalizeFarmerPhone(farmerPhone);
 
   try {
     if (action === 'DELETE') {
@@ -325,24 +770,10 @@ export const syncSavedItemToCloud = async (
       return Boolean(res && res.ok);
     }
 
-    const body = {
-      farmer_phone: phone,
-      item_id: item.id,
-      type: item.type,
-      title: item.title,
-      title_te: item.titleTe,
-      subtitle: item.subtitle,
-      data: item.data ?? {},
-      saved_at: new Date(item.bookmarkedAt).toISOString(),
-    };
+    const parentOk = await ensureParentFarmerExists(phone, profile, lang);
+    if (!parentOk) return false;
 
-    const res = await safeFetch(`${url}/rest/v1/farmer_saved_items`, {
-      method: 'POST',
-      headers: headers({ Prefer: 'resolution=merge-duplicates,return=representation' }),
-      body: JSON.stringify(body),
-    });
-
-    return Boolean(res && res.ok);
+    return upsertRow('farmer_saved_items', savedItemBody(phone, item), 'id');
   } catch (error) {
     console.warn('[DB] syncSavedItemToCloud failed:', error);
     return false;
@@ -352,34 +783,42 @@ export const syncSavedItemToCloud = async (
 export const insertAiQuestionToCloud = async (
   farmerPhone: string,
   question: QuestionRecord,
+  profile?: FarmerProfile,
+  lang?: Language,
 ): Promise<boolean> => {
   const url = getSupabaseUrl();
   const key = getSupabaseAnonKey();
   if (!url || !key) return false;
 
-  const phone = normalizePhone(farmerPhone);
+  const phone = normalizeFarmerPhone(farmerPhone);
 
   try {
-    const body = {
-      farmer_phone: phone,
-      question_text: question.questionText ?? '',
-      question_te: question.questionTe ?? '',
-      answer_title: question.answerTitle ?? '',
-      asked_at: question.askedAt
-        ? new Date(question.askedAt).toISOString()
-        : new Date().toISOString(),
-      source: question.source ?? 'offline',
-    };
-
-    const res = await safeFetch(`${url}/rest/v1/farmer_ai_questions`, {
-      method: 'POST',
-      headers: headers({ Prefer: 'return=representation' }),
-      body: JSON.stringify(body),
-    });
-
-    return Boolean(res && res.ok);
+    const parentOk = await ensureParentFarmerExists(phone, profile, lang);
+    if (!parentOk) return false;
+    return upsertRow('farmer_ai_questions', questionBody(phone, question), 'id');
   } catch (error) {
     console.warn('[DB] insertAiQuestionToCloud failed:', error);
+    return false;
+  }
+};
+
+export const deleteAiQuestionFromCloud = async (
+  farmerPhone: string,
+  questionId: string,
+): Promise<boolean> => {
+  const url = getSupabaseUrl();
+  const key = getSupabaseAnonKey();
+  if (!url || !key) return false;
+
+  const phone = normalizeFarmerPhone(farmerPhone);
+  try {
+    const res = await safeFetch(
+      `${url}/rest/v1/farmer_ai_questions?farmer_phone=eq.${encodeURIComponent(phone)}&id=eq.${encodeURIComponent(`${phone}_${questionId}`)}`,
+      { method: 'DELETE', headers: headers() },
+    );
+    return Boolean(res && res.ok);
+  } catch (error) {
+    console.warn('[DB] deleteAiQuestionFromCloud failed:', error);
     return false;
   }
 };
@@ -389,31 +828,74 @@ export const upsertSchemeCheckToCloud = async (
   wizardInputs: Record<string, unknown>,
   checkedDocs: string[],
   eligibleCount: number,
+  profile?: FarmerProfile,
+  lang?: Language,
 ): Promise<boolean> => {
   const url = getSupabaseUrl();
   const key = getSupabaseAnonKey();
   if (!url || !key) return false;
 
-  const phone = normalizePhone(farmerPhone);
+  const phone = normalizeFarmerPhone(farmerPhone);
 
   try {
-    const body = {
-      farmer_phone: phone,
-      wizard_inputs: wizardInputs,
-      checked_docs: checkedDocs,
-      eligible_count: eligibleCount,
-      updated_at: new Date().toISOString(),
-    };
+    const parentOk = await ensureParentFarmerExists(phone, profile, lang);
+    if (!parentOk) return false;
 
-    const res = await safeFetch(`${url}/rest/v1/farmer_scheme_checks`, {
-      method: 'POST',
-      headers: headers({ Prefer: 'resolution=merge-duplicates,return=representation' }),
-      body: JSON.stringify(body),
-    });
-
-    return Boolean(res && res.ok);
+    return upsertRow(
+      'farmer_scheme_checks',
+      schemeCheckBody(phone, {
+        wizardInputs,
+        checkedDocuments: checkedDocs,
+        eligibleCount,
+      }),
+      'farmer_phone',
+    );
   } catch (error) {
     console.warn('[DB] upsertSchemeCheckToCloud failed:', error);
+    return false;
+  }
+};
+
+/**
+ * Parent-first bulk push. Called on login/launch and from "Sync Now" so every
+ * local item immediately lands in all four Supabase tables.
+ */
+export const syncAllLocalDataToCloud = async (
+  state: CloudSyncState,
+): Promise<boolean> => {
+  if (!isCloudDbConfigured()) return false;
+
+  try {
+    const phone = normalizeFarmerPhone(
+      state.farmer?.phone ?? state.farmer?.phoneMasked,
+    );
+    const parentOk = await upsertFarmerProfileToCloud(
+      { ...state.farmer, phone, phoneMasked: phone },
+      state.language,
+    );
+    if (!parentOk) return false;
+
+    const writes: Promise<boolean>[] = [];
+    for (const item of state.savedItems ?? []) {
+      writes.push(upsertRow('farmer_saved_items', savedItemBody(phone, item), 'id'));
+    }
+    for (const question of state.questionHistory ?? []) {
+      writes.push(upsertRow('farmer_ai_questions', questionBody(phone, question), 'id'));
+    }
+    if (state.schemeCheck) {
+      writes.push(
+        upsertRow(
+          'farmer_scheme_checks',
+          schemeCheckBody(phone, state.schemeCheck),
+          'farmer_phone',
+        ),
+      );
+    }
+
+    const results = await Promise.all(writes);
+    return results.every(Boolean);
+  } catch (error) {
+    console.warn('[DB] syncAllLocalDataToCloud failed:', error);
     return false;
   }
 };

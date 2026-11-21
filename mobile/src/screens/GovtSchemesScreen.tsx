@@ -41,7 +41,11 @@ import {
   transcribeAudio,
   SarvamLang,
 } from '../services/sarvamVoiceService';
-import { useAppStore } from '../store/useAppStore';
+import {
+  useAppStore,
+  type ChatThreadMessage,
+  type SchemeCheckSnapshot,
+} from '../store/useAppStore';
 import { getDict, getLineHeight } from '../i18n/translations';
 import {
   CROP_LABELS,
@@ -138,6 +142,49 @@ const STATUS_META = {
 
 /** Kept out of the component so render passes stay free of impure calls. */
 const getBookmarkTimestamp = (): number => Date.now();
+
+const schemeWizardInputs = (
+  profile: FarmerSchemeProfile,
+): Record<string, unknown> => ({
+  district: profile.district,
+  state: profile.state,
+  socialCategory: profile.socialCategory,
+  excludedByIncomeTax: profile.excludedByIncomeTax,
+  acres: profile.acres,
+  ownership: profile.ownership,
+  ePanta: profile.ePanta,
+  crops: profile.crops,
+  irrigation: profile.irrigation,
+  priorityNeed: profile.priorityNeed,
+});
+
+const checkedDocumentIds = (
+  checkedDocs: Record<string, Record<string, boolean>>,
+): string[] =>
+  Object.entries(checkedDocs).flatMap(([schemeId, docs]) =>
+    Object.entries(docs)
+      .filter(([, checked]) => checked)
+      .map(([docKey]) => `${schemeId}:${docKey}`),
+  );
+
+const financialBreakdownText = (
+  evaluation: SchemeEvaluation,
+  isTe: boolean,
+): string => {
+  const rows = evaluation.financialBreakdown
+    .map((row) =>
+      isTe
+        ? `${row.labelTe}: ${row.value}`
+        : `${row.labelEn}: ${row.value}`,
+    )
+    .filter(Boolean);
+  return [
+    isTe ? evaluation.calculatedBenefitTe : evaluation.calculatedBenefitEn,
+    ...rows,
+  ]
+    .filter(Boolean)
+    .join('\n');
+};
 
 const districtLabel = (id: DistrictId, isTe: boolean): string => {
   const found = DISTRICTS.find((district) => district.id === id);
@@ -238,7 +285,8 @@ export default function GovtSchemesScreen() {
     savedItems,
     addSavedItem,
     removeSavedItem,
-    incrementQuestions,
+    addQuestion,
+    setSchemeCheck,
   } = useAppStore();
   const dict = getDict(language);
   const isTe = language === 'te';
@@ -262,6 +310,9 @@ export default function GovtSchemesScreen() {
   const [aiAnswers, setAiAnswers] = useState<Record<string, SchemeAiAnswer>>(
     {},
   );
+  const [advisorThreads, setAdvisorThreads] = useState<
+    Record<string, ChatThreadMessage[]>
+  >({});
   const [question, setQuestion] = useState('');
   const [asking, setAsking] = useState(false);
   const [playingSchemeAudio, setPlayingSchemeAudio] = useState(false);
@@ -291,20 +342,33 @@ export default function GovtSchemesScreen() {
     [audioRecorder],
   );
 
+  const persistSchemeCheck = useCallback(
+    (nextProfile: FarmerSchemeProfile, nextCheckedDocs: Record<string, Record<string, boolean>>) => {
+      const snapshot: SchemeCheckSnapshot = {
+        wizardInputs: schemeWizardInputs(nextProfile),
+        checkedDocuments: checkedDocumentIds(nextCheckedDocs),
+        eligibleCount: evaluateSchemes(nextProfile).filter(
+          (evaluation) => evaluation.status === 'ELIGIBLE',
+        ).length,
+      };
+      setSchemeCheck(snapshot);
+    },
+    [setSchemeCheck],
+  );
+
   const updateProfile = useCallback(
     <K extends keyof FarmerSchemeProfile,>(
       key: K,
       value: FarmerSchemeProfile[K],
     ) => {
-      setProfile((current) => {
-        const next = { ...current, [key]: value };
-        if (key === 'district') {
-          next.state = getStateForDistrict(value as DistrictId);
-        }
-        return next;
-      });
+      const next = { ...profile, [key]: value };
+      if (key === 'district') {
+        next.state = getStateForDistrict(value as DistrictId);
+      }
+      setProfile(next);
+      persistSchemeCheck(next, checkedDocs);
     },
-    [],
+    [checkedDocs, persistSchemeCheck, profile],
   );
 
   const evaluations = useMemo(() => {
@@ -369,12 +433,37 @@ export default function GovtSchemesScreen() {
         removeSavedItem(scheme.id);
         return;
       }
+      const evaluation =
+        evaluations.find((item) => item.scheme.id === scheme.id) ?? null;
+      const savedAt = getBookmarkTimestamp();
+      const questionEn = `Which government schemes am I eligible for? ${scheme.nameEn}`;
+      const questionTe = `నేను ఏ ప్రభుత్వ పథకాలకు అర్హులను? ${scheme.nameTe}`;
       addSavedItem({
         id: scheme.id,
         type: 'scheme',
+        category: 'scheme',
         title: scheme.nameEn,
         titleTe: scheme.nameTe,
         subtitle: scheme.benefitEn,
+        questionEn,
+        questionTe,
+        diagnosisEn: scheme.nameEn,
+        diagnosisTe: scheme.nameTe,
+        fullResponseEn: evaluation
+          ? buildGuideText(evaluation, false)
+          : `${scheme.descriptionEn}\n${scheme.benefitEn}\n${scheme.eligibilityNoteEn}`,
+        fullResponseTe: evaluation
+          ? buildGuideText(evaluation, true)
+          : `${scheme.descriptionTe}\n${scheme.benefitTe}\n${scheme.eligibilityNoteTe}`,
+        chemicalDosageEn: evaluation
+          ? financialBreakdownText(evaluation, false)
+          : scheme.benefitEn,
+        chemicalDosageTe: evaluation
+          ? financialBreakdownText(evaluation, true)
+          : scheme.benefitTe,
+        weatherWarningEn: evaluation?.nextActionEn ?? '',
+        weatherWarningTe: evaluation?.nextActionTe ?? '',
+        chatThread: advisorThreads[scheme.id],
         data: {
           category: scheme.category,
           // FarmerProfileScreen renders this as string[].
@@ -382,10 +471,11 @@ export default function GovtSchemesScreen() {
           portalUrl: scheme.portalUrl,
           source: scheme.source,
         },
-        bookmarkedAt: getBookmarkTimestamp(),
+        bookmarkedAt: savedAt,
+        savedAt,
       });
     },
-    [addSavedItem, bookmarkedIds, isTe, removeSavedItem],
+    [addSavedItem, advisorThreads, bookmarkedIds, evaluations, isTe, removeSavedItem],
   );
 
   const playAudioGuide = async () => {
@@ -437,13 +527,13 @@ export default function GovtSchemesScreen() {
   };
 
   const toggleDoc = (schemeId: string, docKey: string) => {
-    setCheckedDocs((current) => {
-      const forScheme = current[schemeId] ?? {};
-      return {
-        ...current,
-        [schemeId]: { ...forScheme, [docKey]: !forScheme[docKey] },
-      };
-    });
+    const forScheme = checkedDocs[schemeId] ?? {};
+    const next = {
+      ...checkedDocs,
+      [schemeId]: { ...forScheme, [docKey]: !forScheme[docKey] },
+    };
+    setCheckedDocs(next);
+    persistSchemeCheck(profile, next);
   };
 
   const startRecording = async () => {
@@ -517,11 +607,44 @@ export default function GovtSchemesScreen() {
           asked,
           language,
         );
+        const schemeId = evaluation.scheme.id;
         setAiAnswers((current) => ({
           ...current,
-          [evaluation.scheme.id]: answer,
+          [schemeId]: answer,
         }));
-        incrementQuestions();
+
+        const now = Date.now();
+        const nextThread: ChatThreadMessage[] = [
+          ...(advisorThreads[schemeId] ?? []),
+          { role: 'farmer', textEn: asked, textTe: asked, timestamp: now },
+          {
+            role: 'ai',
+            textEn: answer.answerEn,
+            textTe: answer.answerTe,
+            timestamp: now + 1,
+          },
+        ];
+        setAdvisorThreads((current) => ({ ...current, [schemeId]: nextThread }));
+
+        addQuestion({
+          id: `scheme-${schemeId}-${now}`,
+          questionEn: asked,
+          questionTe: asked,
+          questionText: asked,
+          answerTitle: evaluation.scheme.nameEn,
+          diagnosisEn: evaluation.scheme.nameEn,
+          diagnosisTe: evaluation.scheme.nameTe,
+          fullResponseEn: answer.answerEn,
+          fullResponseTe: answer.answerTe,
+          chemicalDosageEn: financialBreakdownText(evaluation, false),
+          chemicalDosageTe: financialBreakdownText(evaluation, true),
+          weatherWarningEn: evaluation.nextActionEn,
+          weatherWarningTe: evaluation.nextActionTe,
+          chatThread: nextThread,
+          queryType: 'SCHEME',
+          askedAt: new Date(now).toISOString(),
+          source: 'scheme-advisor',
+        });
       } catch (error) {
         console.error('[Schemes] AI advisor failed:', error);
         Alert.alert(
@@ -534,7 +657,7 @@ export default function GovtSchemesScreen() {
         setAsking(false);
       }
     },
-    [asking, incrementQuestions, isTe, language, profile, question],
+    [addQuestion, advisorThreads, asking, isTe, language, profile, question],
   );
 
   const listenSchemeGuide = async (evaluation: SchemeEvaluation) => {

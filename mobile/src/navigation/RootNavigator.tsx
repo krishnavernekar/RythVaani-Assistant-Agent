@@ -9,6 +9,7 @@ import { Colors, spacing } from '../theme/tokens';
 import { useAppStore } from '../store/useAppStore';
 import { getDict } from '../i18n/translations';
 import { stopSpeaking } from '../utils/voice';
+import FarmerOnboardingModal from '../components/FarmerOnboardingModal';
 
 // Screens
 import WelcomeAuthScreen from '../screens/WelcomeAuthScreen';
@@ -124,54 +125,68 @@ function BottomTabNavigator() {
  *   - AgrometWeatherScreen (stack navigates into it from Home)
  */
 export default function RootNavigator() {
-  const { isAuthenticated, isGuest } = useAppStore();
+  const { isAuthenticated, isGuest, syncNow } = useAppStore();
   const hasAccess = isAuthenticated || isGuest;
 
+  // App launch / login: push any locally cached farmer, questions, bookmarks
+  // and scheme check into all four Supabase tables in the background.
+  React.useEffect(() => {
+    if (isAuthenticated && !isGuest) syncNow();
+  }, [isAuthenticated, isGuest, syncNow]);
+
   return (
-    <NavigationContainer
-      // Global audio guard: any tab switch, push, modal or auth transition
-      // stops both expo-speech TTS and Sarvam Bulbul playback.
-      onReady={stopSpeaking}
-      onStateChange={stopSpeaking}
-    >
-      <StatusBar style="dark" />
-      <Stack.Navigator
-        screenOptions={{
-          gestureEnabled: true,
-        }}
+    <View style={styles.root}>
+      <NavigationContainer
+        // Global audio guard: any tab switch, push, modal or auth transition
+        // stops both expo-speech TTS and Sarvam Bulbul playback.
+        onReady={stopSpeaking}
+        onStateChange={stopSpeaking}
       >
-        {!hasAccess ? (
-          <Stack.Screen name="WelcomeAuth" component={WelcomeAuthScreen} />
-        ) : (
-          <>
-            <Stack.Screen
-              name="MainTabs"
-              component={BottomTabNavigator}
-              options={{ animation: 'slide_from_bottom' }}
-            />
-            <Stack.Screen
-              name="AgrometWeather"
-              component={AgrometWeatherScreen}
-              options={{ presentation: 'modal', animation: 'slide_from_bottom' }}
-            />
-            <Stack.Screen
-              name="CropHealthScanner"
-              component={CropScannerScreen}
-              options={{ presentation: 'modal' }}
-            />
-            <Stack.Screen
-              name="ApiStatus"
-              component={ApiStatusScreen}
-              options={{ title: 'AI Diagnostics' }}
-            />
-          </>
-        )}
-      </Stack.Navigator>
-    </NavigationContainer>
+        <StatusBar style="dark" />
+        <Stack.Navigator
+          screenOptions={{
+            gestureEnabled: true,
+          }}
+        >
+          {!hasAccess ? (
+            <Stack.Screen name="WelcomeAuth" component={WelcomeAuthScreen} />
+          ) : (
+            <>
+              <Stack.Screen
+                name="MainTabs"
+                component={BottomTabNavigator}
+                options={{ animation: 'slide_from_bottom' }}
+              />
+              <Stack.Screen
+                name="AgrometWeather"
+                component={AgrometWeatherScreen}
+                options={{ presentation: 'modal', animation: 'slide_from_bottom' }}
+              />
+              <Stack.Screen
+                name="CropHealthScanner"
+                component={CropScannerScreen}
+                options={{ presentation: 'modal' }}
+              />
+              <Stack.Screen
+                name="ApiStatus"
+                component={ApiStatusScreen}
+                options={{ title: 'AI Diagnostics' }}
+              />
+            </>
+          )}
+        </Stack.Navigator>
+      </NavigationContainer>
+
+      {/* First-time setup / Edit Profile is global so it appears right after OTP. */}
+      <FarmerOnboardingModal />
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
   tabIconWrap: {
     width: 40,
     height: 40,

@@ -18,7 +18,7 @@ import { useNavigation } from '@react-navigation/native';
 import { TopHeader } from '../components/TopHeader';
 import { Colors, spacing, tokens } from '../theme/tokens';
 import { speak, stopSpeaking } from '../utils/voice';
-import { useAppStore } from '../store/useAppStore';
+import { useAppStore, type ChatThreadMessage } from '../store/useAppStore';
 import { getLineHeight } from '../i18n/translations';
 import { fetchWeather } from '../services/weatherService';
 import {
@@ -34,10 +34,46 @@ const advisoryBookmarkId = (title: string): string =>
 /** Kept at module scope to keep the render pass free of impure calls. */
 const getTimestamp = (): number => Date.now();
 
+/** One complete question/answer exchange, ready for the full-chat viewer. */
+const buildAdvisoryChatThread = (
+  questionEn: string,
+  questionTe: string,
+  advisory: AiResponse,
+): ChatThreadMessage[] => {
+  const now = Date.now();
+  return [
+    {
+      role: 'farmer',
+      textEn: questionEn,
+      textTe: questionTe || questionEn,
+      timestamp: now,
+    },
+    {
+      role: 'ai',
+      textEn: [
+        advisory.diagnosis_title_en,
+        advisory.advisory_en,
+        advisory.chemical_dosage_en,
+        advisory.weather_warning_en,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      textTe: [
+        advisory.diagnosis_title_te,
+        advisory.advisory_te,
+        advisory.chemical_dosage_te,
+        advisory.weather_warning_te,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      timestamp: now + 1,
+    },
+  ];
+};
+
 export default function AskAgronomistScreen() {
   const navigation = useNavigation<any>();
-  const { language, incrementQuestions, savedItems, toggleSavedItem, addQuestion } =
-    useAppStore();
+  const { language, savedItems, toggleSavedItem, addQuestion } = useAppStore();
   const isTe = language === 'te';
   const sarvamLang: SarvamLang =
     language === 'en' ? 'en-IN' : language === 'hi' ? 'hi-IN' : 'te-IN';
@@ -209,11 +245,26 @@ useEffect(() => {
             : `AI could not answer — showing the offline ANGRAU advisory. Reason: ${result.failureReason}`,
         );
       }
-      incrementQuestions();
+      const questionEn =
+        result.transcript_en.trim() || transcriptEn.trim() || result.diagnosis_title_en;
+      const questionTe =
+        result.transcript_te.trim() || transcriptTe.trim() || result.diagnosis_title_te;
       addQuestion({
-        questionText: transcriptEn.trim() || result.diagnosis_title_en,
-        questionTe: transcriptTe.trim() || result.diagnosis_title_te,
+        id: `ask-${Date.now()}`,
+        questionText: questionEn,
+        questionEn,
+        questionTe,
         answerTitle: result.diagnosis_title_en,
+        diagnosisEn: result.diagnosis_title_en,
+        diagnosisTe: result.diagnosis_title_te,
+        fullResponseEn: result.advisory_en,
+        fullResponseTe: result.advisory_te,
+        chemicalDosageEn: result.chemical_dosage_en,
+        chemicalDosageTe: result.chemical_dosage_te,
+        weatherWarningEn: result.weather_warning_en,
+        weatherWarningTe: result.weather_warning_te,
+        chatThread: buildAdvisoryChatThread(questionEn, questionTe, result),
+        queryType: 'VOICE',
         askedAt: new Date().toISOString(),
         source: 'voice',
       });
@@ -231,17 +282,39 @@ useEffect(() => {
 
   const saveAdvisory = () => {
     if (!advisory) return;
+    const questionEn =
+      advisory.transcript_en.trim() || transcriptEn.trim() || advisory.diagnosis_title_en;
+    const questionTe =
+      advisory.transcript_te.trim() || transcriptTe.trim() || advisory.diagnosis_title_te;
+    const savedAt = getTimestamp();
     toggleSavedItem({
       id: advisoryBookmarkId(advisory.diagnosis_title_en),
       type: 'advisory',
+      category: 'advisory',
       title: advisory.diagnosis_title_en,
       titleTe: advisory.diagnosis_title_te,
       subtitle: advisory.chemical_dosage_en,
+      questionEn,
+      questionTe,
+      diagnosisEn: advisory.diagnosis_title_en,
+      diagnosisTe: advisory.diagnosis_title_te,
+      fullResponseEn: advisory.advisory_en,
+      fullResponseTe: advisory.advisory_te,
+      chemicalDosageEn: advisory.chemical_dosage_en,
+      chemicalDosageTe: advisory.chemical_dosage_te,
+      weatherWarningEn: advisory.weather_warning_en,
+      weatherWarningTe: advisory.weather_warning_te,
+      chatThread: buildAdvisoryChatThread(questionEn, questionTe, advisory),
       data: {
         advisory_en: advisory.advisory_en,
         advisory_te: advisory.advisory_te,
+        chemical_dosage_en: advisory.chemical_dosage_en,
+        chemical_dosage_te: advisory.chemical_dosage_te,
+        weather_warning_en: advisory.weather_warning_en,
+        weather_warning_te: advisory.weather_warning_te,
       },
-      bookmarkedAt: getTimestamp(),
+      bookmarkedAt: savedAt,
+      savedAt,
     });
   };
 

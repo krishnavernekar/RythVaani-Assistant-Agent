@@ -31,8 +31,11 @@ export function TopHeader({
   onNotificationPress,
 }: TopHeaderProps) {
   const insets = useSafeAreaInsets();
-  const { language, setLanguage } = useAppStore();
+  const { language, setLanguage, farmer } = useAppStore();
   const isTelugu = language === 'te';
+  const locationText = isTelugu
+    ? farmer.mandalTe || farmer.mandal || 'గుంటూరు మండలం'
+    : farmer.mandal || farmer.district || 'Guntur';
 
   const handleLangToggle = () => {
     const next: Language = isTelugu ? 'en' : 'te';
@@ -60,7 +63,7 @@ export function TopHeader({
             </TouchableOpacity>
           ) : (
             <Text style={styles.locationPill} numberOfLines={1}>
-              📍 Guntur, AP • గుంట్ూరు
+              📍 {locationText}
             </Text>
           )}
           <Text

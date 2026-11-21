@@ -14,16 +14,19 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  Modal,
-  TextInput,
   Alert,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { TopHeader } from '../components/TopHeader';
 import { Colors, spacing, tokens } from '../theme/tokens';
-import { speak, stopSpeaking } from '../utils/voice';
-import { playIndicVoice, SarvamLang } from '../services/sarvamVoiceService';
-import { Language, useAppStore } from '../store/useAppStore';
+import { stopSpeaking } from '../utils/voice';
+import {
+  Language,
+  QuestionRecord,
+  SavedItem,
+  useAppStore,
+} from '../store/useAppStore';
+import FullConversationModal from '../components/FullConversationModal';
 import { getDict, getLineHeight } from '../i18n/translations';
 
 type TabKey = 'saved' | 'questions' | 'settings';
@@ -34,29 +37,40 @@ export default function FarmerProfileScreen() {
     language,
     farmer,
     savedItems,
-    questionsAsked,
+    questionHistory,
     removeSavedItem,
+    removeQuestion,
     setLanguage,
     setIsAuthenticated,
     setIsGuest,
     cloudSyncStatus,
     syncNow,
+    openProfileSetup,
   } = useAppStore();
   const dict = getDict(language);
   const isTe = language === 'te';
-  const sarvamLang: SarvamLang =
-    language === 'en' ? 'en-IN' : language === 'hi' ? 'hi-IN' : 'te-IN';
 
   const [activeTab, setActiveTab] = useState<TabKey>('saved');
-  const [showEditModal, setShowEditModal] = useState(false);
-  const [editName, setEditName] = useState(farmer.name);
+  const [viewer, setViewer] = useState<
+    { kind: 'saved' | 'question'; id: string } | null
+  >(null);
 
   React.useEffect(() => {
     return () => stopSpeaking();
   }, []);
 
-  // Derived counts — read directly from the store so saves/questions appear instantly.
-  const questionCount = questionsAsked;
+  // Per-phone bindings — exact values restored from Supabase / local cache.
+  const displayName = isTe
+    ? farmer.nameTe || farmer.nameEn || farmer.name
+    : farmer.nameEn || farmer.name;
+  const displayPhone = farmer.phone || farmer.phoneMasked;
+  const displayMandal = isTe
+    ? farmer.mandalTe || farmer.mandal
+    : farmer.mandal;
+  const displayAddress = farmer.address || '';
+
+  // Derived counts — questionHistory is the per-phone source of truth.
+  const questionCount = questionHistory.length;
   const savedCount = savedItems.length;
 
   // Crop pills from store
@@ -71,8 +85,17 @@ export default function FarmerProfileScreen() {
   const schemeItems = savedItems.filter((i) => i.type === 'scheme');
   const advisoryItems = savedItems.filter((i) => i.type === 'advisory');
 
-  const handlePlayAdvisory = (text: string) => {
-    playIndicVoice(text, sarvamLang, () => speak(text, { language: sarvamLang }));
+  const viewerItem: SavedItem | QuestionRecord | null = viewer
+    ? viewer.kind === 'saved'
+      ? savedItems.find((item) => item.id === viewer.id) ?? null
+      : questionHistory.find((item) => item.id === viewer.id) ?? null
+    : null;
+
+  const handleDeleteViewerItem = () => {
+    if (!viewer) return;
+    if (viewer.kind === 'saved') removeSavedItem(viewer.id);
+    else removeQuestion(viewer.id);
+    setViewer(null);
   };
 
   const handleSelectLanguage = (lang: Language) => {
@@ -120,15 +143,23 @@ export default function FarmerProfileScreen() {
               <Text style={styles.avatar}>👨‍🌾</Text>
             </View>
             <View style={styles.identityInfo}>
-              <Text style={styles.farmerName}>{farmer.name}</Text>
-              <Text style={styles.farmerPhone}>{farmer.phoneMasked}</Text>
-              <Text style={styles.farmerLocation}>
-                📍 {isTe ? farmer.mandalTe : farmer.mandal}
-              </Text>
+              <Text style={styles.farmerName}>{displayName}</Text>
+              <Text style={styles.farmerPhone}>{displayPhone}</Text>
+              <Text style={styles.farmerLocation}>📍 {displayMandal}</Text>
+              {displayAddress ? (
+                <Text style={styles.farmerAddress}>{displayAddress}</Text>
+              ) : null}
             </View>
             <View style={styles.pattadarBadge}>
               <Text style={styles.pattadarBadgeText}>
-                🛡️ {isTe ? 'పట్టాదారు' : 'Pattadar'}
+                🛡️{' '}
+                {farmer.category === 'Tenant'
+                  ? isTe
+                    ? 'కౌలు రైతు'
+                    : 'Tenant'
+                  : isTe
+                    ? 'పట్టాదారు'
+                    : 'Pattadar'}
               </Text>
             </View>
           </View>
@@ -136,8 +167,8 @@ export default function FarmerProfileScreen() {
           <View style={styles.acreageRow}>
             <Text style={styles.acreageValue}>{farmer.acres} Acres</Text>
             <Text style={styles.acreageLabel}>({farmer.acreageLabel})</Text>
-            <TouchableOpacity onPress={() => setShowEditModal(true)}>
-              <Text style={styles.editBtn}>{dict.common.edit}</Text>
+            <TouchableOpacity onPress={openProfileSetup}>
+              <Text style={styles.editBtn}>Edit Profile / ప్రాధాన్యతలు</Text>
             </TouchableOpacity>
           </View>
 
@@ -264,24 +295,21 @@ export default function FarmerProfileScreen() {
             ) : (
               <>
                 {schemeItems.map((item) => (
-                  <SchemeBookmarkedCard
+                  <ConversationPreviewCard
                     key={item.id}
                     item={item}
+                    kind="saved"
                     isTe={isTe}
-                    onUnbookmark={() => removeSavedItem(item.id)}
+                    onPress={() => setViewer({ kind: 'saved', id: item.id })}
                   />
                 ))}
                 {advisoryItems.map((item) => (
-                  <AdvisoryBookmarkedCard
+                  <ConversationPreviewCard
                     key={item.id}
                     item={item}
+                    kind="saved"
                     isTe={isTe}
-                    onPlay={() =>
-                      handlePlayAdvisory(
-                        isTe ? item.titleTe : item.title,
-                      )
-                    }
-                    onUnbookmark={() => removeSavedItem(item.id)}
+                    onPress={() => setViewer({ kind: 'saved', id: item.id })}
                   />
                 ))}
               </>
@@ -299,6 +327,7 @@ export default function FarmerProfileScreen() {
                 </Text>
               </View>
             ) : (
+              <>
               <View style={styles.questionSummary}>
                 <Text style={styles.questionSummaryTitle}>
                   {isTe ? `మీరు ${questionCount} ప్రశ్నలను అడిగారు` : `You've asked ${questionCount} questions`}
@@ -317,6 +346,18 @@ export default function FarmerProfileScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
+              {questionHistory.map((item) => (
+                <ConversationPreviewCard
+                  key={item.id ?? item.askedAt}
+                  item={item}
+                  kind="question"
+                  isTe={isTe}
+                  onPress={() =>
+                    item.id ? setViewer({ kind: 'question', id: item.id }) : undefined
+                  }
+                />
+              ))}
+              </>
             )}
           </View>
         )}
@@ -336,121 +377,83 @@ export default function FarmerProfileScreen() {
         <View style={{ height: 100 }} />
       </ScrollView>
 
-      {/* Edit Name Modal */}
-      <Modal visible={showEditModal} animationType="slide" transparent>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>
-              {isTe ? 'పేరును మార్చండி' : 'Edit Your Name'}
-            </Text>
-            <TextInput
-              style={styles.modalInput}
-              value={editName}
-              onChangeText={setEditName}
-              placeholder={isTe ? 'మీ పేరు నమోదు చేయండీ' : 'Enter your name'}
-              placeholderTextColor={Colors.slateLight}
-            />
-            <View style={styles.modalActions}>
-              <TouchableOpacity
-                style={styles.modalCancelBtn}
-                onPress={() => setShowEditModal(false)}
-              >
-                <Text style={styles.modalCancelText}>
-                  {dict.common.close}
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.modalSaveBtn}
-                onPress={() => {
-                  // In a real app, update the farmer profile via Zustand
-                  setShowEditModal(false);
-                }}
-              >
-                <Text style={styles.modalSaveText}>
-                  {dict.common.save}
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+      <FullConversationModal
+        visible={viewerItem !== null}
+        item={viewerItem}
+        isTe={isTe}
+        language={language}
+        onClose={() => setViewer(null)}
+        onDelete={handleDeleteViewerItem}
+      />
     </View>
   );
 }
 
 /* ─── Sub-components ──────────────────────────────────────────────────────── */
 
-function SchemeBookmarkedCard({
+/** Preview shared by both the Saved and Questions tabs. */
+function ConversationPreviewCard({
   item,
+  kind,
   isTe,
-  onUnbookmark,
+  onPress,
 }: {
-  item: NonNullable<unknown>;
+  item: SavedItem | QuestionRecord;
+  kind: 'saved' | 'question';
   isTe: boolean;
-  onUnbookmark: () => void;
+  onPress: () => void;
 }) {
-  const data = (item as { data?: Record<string, unknown> }).data ?? {};
-  const installment = data.installment as number | undefined;
-  const nextInstallment = data.nextInstallment as number | undefined;
-  const installmentDate = data.installmentDate as string | undefined;
-  const docs = data.docs as string[] | undefined;
+  const isSaved = 'bookmarkedAt' in item;
+  const saved = item as SavedItem;
+  const asked = item as QuestionRecord;
+  const questionEn =
+    (isSaved ? saved.questionEn : asked.questionEn || asked.questionText) || '';
+  const questionTe =
+    (isSaved ? saved.questionTe : asked.questionTe || asked.questionText) || '';
+  const diagnosisEn =
+    (isSaved
+      ? saved.diagnosisEn || saved.title
+      : asked.diagnosisEn || asked.titleEn || asked.answerTitle) || '';
+  const diagnosisTe =
+    (isSaved
+      ? saved.diagnosisTe || saved.titleTe || saved.title
+      : asked.diagnosisTe || asked.titleTe || asked.answerTitle) || '';
+  const responseEn = (isSaved ? saved.fullResponseEn : asked.fullResponseEn) || '';
+  const responseTe = (isSaved ? saved.fullResponseTe : asked.fullResponseTe) || '';
+  const tag = isTe
+    ? kind === 'question'
+      ? '💬 ప్రశ్నల చరిత్ర'
+      : isSaved && saved.type === 'scheme'
+        ? '🛡️ ప్రభుత్వ పథకం'
+        : '🤖 AI సలహా'
+    : kind === 'question'
+      ? '💬 Question History'
+      : isSaved && saved.type === 'scheme'
+        ? '🛡️ Government Scheme'
+        : '🤖 AI Advisory';
 
   return (
-    <View style={styles.bookmarkCard}>
-      <View style={styles.bookmarkHeader}>
-        <View>
-          <Text style={styles.bookmarkTag}>🛡️ Government Scheme</Text>
-          <Text style={styles.bookmarkName}>{isTe ? (item as { titleTe: string }).titleTe : (item as { title: string }).title}</Text>
-        </View>
-        <TouchableOpacity onPress={onUnbookmark} hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}>
-          <Text style={styles.unbookmarkIcon}>🔖</Text>
-        </TouchableOpacity>
-      </View>
-      {installment && (
-        <Text style={styles.bookmarkAmount}>
-          ₹{installment.toLocaleString('en-IN')}/yr
-          {nextInstallment && ` • Next: ₹${nextInstallment.toLocaleString('en-IN')}${installmentDate ? ` (${installmentDate})` : ''}`}
-        </Text>
-      )}
-      {docs && docs.length > 0 && (
-        <View style={styles.bookmarkDocs}>
-          {docs.map((doc, i) => (
-            <Text key={i} style={styles.bookmarkDocChip}>{doc}</Text>
-          ))}
-        </View>
-      )}
-    </View>
-  );
-}
-
-function AdvisoryBookmarkedCard({
-  item,
-  isTe,
-  onPlay,
-  onUnbookmark,
-}: {
-  item: NonNullable<unknown>;
-  isTe: boolean;
-  onPlay: () => void;
-  onUnbookmark: () => void;
-}) {
-  return (
-    <View style={styles.bookmarkCard}>
-      <View style={styles.bookmarkHeader}>
-        <View>
-          <Text style={styles.bookmarkTag}>🤖 AI Advisory</Text>
-          <Text style={styles.bookmarkName}>{isTe ? (item as { titleTe: string }).titleTe : (item as { title: string }).title}</Text>
-        </View>
-        <View style={styles.bookmarkActions}>
-          <TouchableOpacity onPress={onPlay} hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}>
-            <Text style={styles.playIcon}>🔊</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={onUnbookmark} hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}>
-            <Text style={styles.unbookmarkIcon}>🔖</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </View>
+    <TouchableOpacity style={styles.bookmarkCard} onPress={onPress} activeOpacity={0.85}>
+      <Text style={styles.bookmarkTag}>{tag}</Text>
+      <Text style={styles.bookmarkName} numberOfLines={2}>
+        {isTe ? diagnosisTe || diagnosisEn : diagnosisEn || diagnosisTe}
+      </Text>
+      <Text style={styles.previewLabel}>
+        {isTe ? 'ప్రశ్న' : 'Question'}
+      </Text>
+      <Text style={styles.previewText} numberOfLines={2}>
+        {isTe ? questionTe || questionEn : questionEn || questionTe}
+      </Text>
+      <Text style={styles.previewLabel}>
+        {isTe ? 'AI పరిష్కారం' : 'AI Solution'}
+      </Text>
+      <Text style={styles.previewText} numberOfLines={3}>
+        {isTe ? responseTe || responseEn : responseEn || responseTe}
+      </Text>
+      <Text style={styles.viewFullText}>
+        📖 {isTe ? 'పూర్తి వివరాలు చూడండి' : 'View Full Chat & AI Response'}
+      </Text>
+    </TouchableOpacity>
   );
 }
 
@@ -472,7 +475,9 @@ function SettingsSection({
     name: string;
     mandal: string;
     mandalTe: string;
+    phone?: string;
     phoneMasked: string;
+    address?: string;
   };
   language: Language;
   onSelectLanguage: (lang: Language) => void;
@@ -519,7 +524,7 @@ function SettingsSection({
           label: isTe ? 'మండలం' : 'Mandal',
           value: isTe ? farmer.mandalTe : farmer.mandal,
         },
-        { icon: '📞', label: isTe ? 'ఫోను' : 'Phone', value: farmer.phoneMasked },
+        { icon: '📞', label: isTe ? 'ఫోను' : 'Phone', value: farmer.phone || farmer.phoneMasked },
       ].map((row, i) => (
         <View key={i} style={styles.settingRow}>
           <Text style={styles.settingIcon}>{row.icon}</Text>
@@ -587,6 +592,11 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: Colors.primary,
     fontWeight: '700',
+  },
+  farmerAddress: {
+    fontSize: 11,
+    color: Colors.slate,
+    marginTop: 2,
   },
   pattadarBadge: {
     paddingHorizontal: spacing.sm,
@@ -797,11 +807,6 @@ const styles = StyleSheet.create({
     borderColor: Colors.cardBorder,
     gap: spacing.sm,
   },
-  bookmarkHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-  },
   bookmarkTag: {
     fontSize: 10,
     fontWeight: '700',
@@ -813,30 +818,23 @@ const styles = StyleSheet.create({
     color: Colors.ink,
     marginTop: 4,
   },
-  bookmarkAmount: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: Colors.ink,
-  },
-  bookmarkDocs: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: spacing.xs,
-  },
-  bookmarkDocChip: {
+  previewLabel: {
     fontSize: 10,
+    fontWeight: '900',
+    color: Colors.primary,
+    marginTop: 4,
+  },
+  previewText: {
+    fontSize: 12,
+    lineHeight: 18,
     color: Colors.slate,
-    backgroundColor: '#F1F5F9',
-    paddingHorizontal: 6,
-    paddingVertical: 3,
-    borderRadius: 6,
   },
-  bookmarkActions: {
-    flexDirection: 'row',
-    gap: spacing.sm,
+  viewFullText: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: Colors.primary,
+    marginTop: spacing.sm,
   },
-  playIcon: { fontSize: 18 },
-  unbookmarkIcon: { fontSize: 18 },
 
   // Settings
   settingsSection: {
