@@ -127,15 +127,28 @@ const safeFetch = async (
   }
 };
 
-const toIso = (value?: string | number): string => {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return new Date(value).toISOString();
-  }
+/**
+ * `saved_at` and `asked_at` are bigint columns in the deployed Supabase
+ * schema, so they must be epoch milliseconds — NOT ISO timestamp strings.
+ * PostgreSQL rejects ISO strings with 22P02, which silently emptied both
+ * child tables. Accept numbers and ISO strings from legacy local cache.
+ */
+const toEpochMillis = (value?: string | number | null): number => {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.round(value);
   if (typeof value === 'string' && value.length > 0) {
     const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+    if (!Number.isNaN(parsed.getTime())) return parsed.getTime();
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return Math.round(numeric);
   }
-  return new Date().toISOString();
+  return Date.now();
+};
+
+/** Convert a cloud bigint timestamp back into the ISO string the UI expects. */
+const fromEpochMillis = (value?: string | number | null): string | undefined => {
+  if (value === null || value === undefined || value === '') return undefined;
+  const millis = toEpochMillis(value);
+  return new Date(millis).toISOString();
 };
 
 const stripPhonePrefix = (id: string, phone: string): string =>
@@ -389,7 +402,7 @@ interface DbSavedItemRow {
   subtitle_en?: string;
   subtitle_te?: string;
   benefit_or_dosage?: string | null;
-  saved_at?: string;
+  saved_at?: string | number | null;
 }
 
 interface DbQuestionRow {
@@ -402,7 +415,7 @@ interface DbQuestionRow {
   diagnosis_te?: string;
   advisory_en?: string;
   advisory_te?: string;
-  asked_at?: string;
+  asked_at?: string | number | null;
 }
 
 const rowToFarmer = (row: DbFarmerRow): FarmerProfile => {
@@ -453,7 +466,7 @@ const rowToSavedItem = (row: DbSavedItemRow, phone: string): SavedItem => {
   const payload = english.payload ?? telugu.payload;
   const benefitData = parseBenefitData(row.benefit_or_dosage);
   const benefitRaw = benefitData ? '' : row.benefit_or_dosage ?? '';
-  const savedAt = row.saved_at ? new Date(row.saved_at).getTime() : Date.now();
+  const savedAt = row.saved_at ? toEpochMillis(row.saved_at) : Date.now();
   const itemType = row.item_type === 'advisory' ? 'advisory' : 'scheme';
   const title = row.title_en ?? '';
 
@@ -508,7 +521,7 @@ const rowToQuestion = (row: DbQuestionRow, phone: string): QuestionRecord => {
     weatherWarningTe: payload?.weatherWarningTe ?? '',
     chatThread: payload?.chatThread,
     queryType: row.query_type ?? 'VOICE',
-    askedAt: row.asked_at,
+    askedAt: fromEpochMillis(row.asked_at),
     source: row.query_type ?? 'cloud',
   };
 };
@@ -691,7 +704,13 @@ const upsertRow = async (
       body: JSON.stringify(body),
     },
   );
-  return Boolean(res && res.ok);
+  if (!res) return false;
+  if (!res.ok) {
+    // Surface the PostgREST error instead of silently leaving tables empty.
+    const detail = await res.text().catch(() => '');
+    console.warn(`[DB] upsert ${table} failed (${res.status}):`, detail.slice(0, 400));
+  }
+  return res.ok;
 };
 
 const savedItemBody = (phone: string, item: SavedItem): Record<string, unknown> => {
@@ -707,8 +726,20 @@ const savedItemBody = (phone: string, item: SavedItem): Record<string, unknown> 
     subtitle_en: packFullText(buildSavedReadableText(item, false), payload),
     subtitle_te: packFullText(buildSavedReadableText(item, true), payload),
     benefit_or_dosage: item.chemicalDosageEn || item.badgeEn || '',
-    saved_at: toIso(savedAt),
+    saved_at: toEpochMillis(savedAt),
   };
+};
+
+/**
+ * Legacy local questions may have no id. Deriving a stable id from their
+ * content keeps repeated bulk syncs from creating duplicate cloud rows.
+ */
+const stableLegacyId = (value: string): string => {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return `legacy-${(hash >>> 0).toString(36)}`;
 };
 
 const questionBody = (
@@ -716,20 +747,27 @@ const questionBody = (
   question: QuestionRecord,
 ): Record<string, unknown> => {
   const payload = conversationPayloadFromQuestion(question);
-  const id = question.id ?? `q-${Date.now()}`;
+  const questionEn = question.questionEn ?? question.questionText ?? '';
+  const questionTe = question.questionTe ?? question.questionText ?? '';
+  const askedAt = toEpochMillis(question.askedAt ?? question.savedAt);
+  const id =
+    question.id ??
+    stableLegacyId(
+      `${questionEn}|${questionTe}|${askedAt}|${question.queryType ?? 'VOICE'}`,
+    );
   return {
     id: `${phone}_${id}`,
     farmer_phone: phone,
     query_type: (question.queryType || 'VOICE').toUpperCase(),
-    question_en: question.questionEn ?? question.questionText ?? '',
-    question_te: question.questionTe ?? question.questionText ?? '',
+    question_en: questionEn,
+    question_te: questionTe,
     diagnosis_en:
       question.diagnosisEn ?? question.titleEn ?? question.answerTitle ?? '',
     diagnosis_te:
       question.diagnosisTe ?? question.titleTe ?? question.answerTitle ?? '',
     advisory_en: packFullText(buildQuestionReadableText(question, false), payload),
     advisory_te: packFullText(buildQuestionReadableText(question, true), payload),
-    asked_at: toIso(question.askedAt ?? question.savedAt),
+    asked_at: askedAt,
   };
 };
 
