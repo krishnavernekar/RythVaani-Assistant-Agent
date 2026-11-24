@@ -1,7 +1,7 @@
 /**
  * FarmerProfileScreen — EPIC-08 (FR-06)
  * -------------------------------------
- * • Farmer Identity Card: Venkata Reddy Garu, masked phone, Pattadar badge,
+ * • Farmer Identity Card: logged-in farmer, masked phone, ownership badge,
  *   acreage, mandal, crop pills, Edit button
  * • 3-Stat Row: questionsAsked, savedItems.length, Kharif '25
  * • Tabbed vault: Saved (schemes + AI advisories), Questions (history), Settings
@@ -16,7 +16,7 @@ import {
   TouchableOpacity,
   Alert,
 } from 'react-native';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { TopHeader } from '../components/TopHeader';
 import { Colors, spacing, tokens } from '../theme/tokens';
 import { stopSpeaking } from '../utils/voice';
@@ -35,6 +35,8 @@ export default function FarmerProfileScreen() {
   const navigation = useNavigation<any>();
   const {
     language,
+    isAuthenticated,
+    isGuest,
     farmer,
     savedItems,
     questionHistory,
@@ -59,11 +61,25 @@ export default function FarmerProfileScreen() {
     return () => stopSpeaking();
   }, []);
 
+  // Every visit to the Profile tab refreshes the cloud snapshot silently.
+  useFocusEffect(
+    React.useCallback(() => {
+      if (!isAuthenticated || isGuest) return;
+      void (async () => {
+        await syncNow();
+      })();
+    }, [isAuthenticated, isGuest, syncNow]),
+  );
+
   // Per-phone bindings — exact values restored from Supabase / local cache.
-  const displayName = isTe
-    ? farmer.nameTe || farmer.nameEn || farmer.name
-    : farmer.nameEn || farmer.name;
-  const displayPhone = farmer.phone || farmer.phoneMasked;
+  const displayName =
+    (isTe
+      ? farmer.nameTe || farmer.nameEn || farmer.name
+      : farmer.nameEn || farmer.name) || (isTe ? 'రైతు' : 'Farmer');
+  const displayPhone =
+    farmer.phone ||
+    farmer.phoneMasked ||
+    (isTe ? 'ఫోన్ నమోదు చేయలేదు' : 'Phone not added');
   const displayMandal = isTe
     ? farmer.mandalTe || farmer.mandal
     : farmer.mandal;
@@ -187,15 +203,21 @@ export default function FarmerProfileScreen() {
                     ? '📱 లోకల్ ఆఫ్‌లైన్ స్టోరేజ్'
                     : '📱 Local Offline Storage'}
             </Text>
-            <TouchableOpacity
-              style={styles.syncNowBtn}
-              onPress={() => syncNow()}
-              activeOpacity={0.85}
-            >
-              <Text style={styles.syncNowText}>
-                {isTe ? '↻ ఇప్పుడు సింక్' : '↻ Sync Now'}
+            <View style={styles.autoSyncPill}>
+              <Text style={styles.autoSyncText}>
+                {cloudSyncStatus === 'syncing'
+                  ? isTe
+                    ? '🔄 స్వయంచాలకంగా సింక్ అవుతోంది...'
+                    : '🔄 Auto-Syncing...'
+                  : cloudSyncStatus === 'synced'
+                    ? isTe
+                      ? '☁️ క్లౌడ్ తో స్వయంచాలకంగా సింక్ అయ్యింది'
+                      : '☁️ Auto-Synced with Cloud'
+                    : isTe
+                      ? '📱 లోకల్ ఆఫ్ లైన్ స్టోరేజ్'
+                      : '📱 Local Offline Storage'}
               </Text>
-            </TouchableOpacity>
+            </View>
           </View>
 
           <View style={styles.cropsRow}>
@@ -524,7 +546,11 @@ function SettingsSection({
           label: isTe ? 'మండలం' : 'Mandal',
           value: isTe ? farmer.mandalTe : farmer.mandal,
         },
-        { icon: '📞', label: isTe ? 'ఫోను' : 'Phone', value: farmer.phone || farmer.phoneMasked },
+        {
+          icon: '📞',
+          label: isTe ? 'ఫోను' : 'Phone',
+          value: farmer.phone || farmer.phoneMasked,
+        },
       ].map((row, i) => (
         <View key={i} style={styles.settingRow}>
           <Text style={styles.settingIcon}>{row.icon}</Text>
@@ -634,7 +660,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#15803D',
   },
-  syncNowBtn: {
+  autoSyncPill: {
     paddingHorizontal: spacing.sm,
     paddingVertical: 4,
     borderRadius: 8,
@@ -642,10 +668,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.primary,
   },
-  syncNowText: {
+  autoSyncText: {
     fontSize: 10,
     fontWeight: '800',
     color: Colors.primary,
+    textAlign: 'center',
   },
   acreageValue: {
     fontSize: 15,

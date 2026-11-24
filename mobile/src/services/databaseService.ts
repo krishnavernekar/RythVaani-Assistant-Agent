@@ -164,7 +164,7 @@ const parseCrops = (value: unknown): string[] => {
       .map((crop) => crop.trim())
       .filter(Boolean);
   }
-  return ['Chilli', 'Paddy'];
+  return [];
 };
 
 const acreageLabelFor = (acres: number): string => {
@@ -421,10 +421,12 @@ interface DbQuestionRow {
 const rowToFarmer = (row: DbFarmerRow): FarmerProfile => {
   const combinedMandal = row.mandal ?? '';
   const splitMandal = splitAddressFromMandal(combinedMandal);
-  const nameEn = row.name_en ?? 'Venkata Reddy Garu';
+  const nameEn = row.name_en ?? '';
   const crops = parseCrops(row.primary_crops);
-  const acres = row.acres ?? 4.5;
+  const acresRaw = Number(row.acres);
+  const acres = Number.isFinite(acresRaw) ? acresRaw : 0;
   const phone = normalizeFarmerPhone(row.phone);
+  const mandal = splitMandal.mandal ?? '';
 
   return {
     name: nameEn,
@@ -435,10 +437,10 @@ const rowToFarmer = (row: DbFarmerRow): FarmerProfile => {
     address: splitMandal.address,
     acres,
     acreageLabel: acreageLabelFor(acres),
-    mandal: splitMandal.mandal || 'Guntur Mandal',
-    mandalTe: mandalTeFor(splitMandal.mandal || 'Guntur Mandal'),
-    district: row.district ?? 'Guntur',
-    state: row.state ?? 'Andhra Pradesh',
+    mandal,
+    mandalTe: mandal ? mandalTeFor(mandal) : '',
+    district: row.district ?? '',
+    state: row.state ?? '',
     category:
       (row.ownership_type ?? '').toLowerCase() === 'tenant'
         ? 'Tenant'
@@ -602,8 +604,8 @@ const defaultProfileForPhone = (phone: string): FarmerProfile => ({
   acreageLabel: 'Small/Marginal',
   mandal: '',
   mandalTe: '',
-  district: 'Guntur',
-  state: 'Andhra Pradesh',
+  district: '',
+  state: '',
   category: 'Pattadar',
   crops: [],
   cropsTe: [],
@@ -621,8 +623,8 @@ export const upsertFarmerProfileToCloud = async (
   const nameEn = profile.nameEn ?? profile.name ?? '';
   const nameTe = profile.nameTe ?? nameEn;
   const mandal = foldAddressIntoMandal(profile.address, profile.mandal);
-  const state = profile.state || 'Andhra Pradesh';
-  const district = profile.district || 'Guntur';
+  const state = profile.state || '';
+  const district = profile.district || '';
   const acres = Number.isFinite(profile.acres) ? profile.acres : 0;
   const crops = profile.crops ?? [];
 

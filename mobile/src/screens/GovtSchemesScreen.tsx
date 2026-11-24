@@ -356,6 +356,15 @@ export default function GovtSchemesScreen() {
     [setSchemeCheck],
   );
 
+  // Debounced auto-sync: fires on mount and whenever any wizard input or
+  // document checkbox changes, so farmer_scheme_checks is always populated.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      persistSchemeCheck(profile, checkedDocs);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [profile, checkedDocs, persistSchemeCheck]);
+
   const updateProfile = useCallback(
     <K extends keyof FarmerSchemeProfile,>(
       key: K,
@@ -366,9 +375,8 @@ export default function GovtSchemesScreen() {
         next.state = getStateForDistrict(value as DistrictId);
       }
       setProfile(next);
-      persistSchemeCheck(next, checkedDocs);
     },
-    [checkedDocs, persistSchemeCheck, profile],
+    [profile],
   );
 
   const evaluations = useMemo(() => {
@@ -533,7 +541,6 @@ export default function GovtSchemesScreen() {
       [schemeId]: { ...forScheme, [docKey]: !forScheme[docKey] },
     };
     setCheckedDocs(next);
-    persistSchemeCheck(profile, next);
   };
 
   const startRecording = async () => {

@@ -1,15 +1,23 @@
 import React from 'react';
-import { NavigationContainer } from '@react-navigation/native';
+import {
+  NavigationContainer,
+  useNavigationContainerRef,
+} from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { StatusBar } from 'expo-status-bar';
-import { View, Text, StyleSheet } from 'react-native';
+import { AppState, View, Text, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Colors, spacing } from '../theme/tokens';
 import { useAppStore } from '../store/useAppStore';
 import { getDict } from '../i18n/translations';
 import { stopSpeaking } from '../utils/voice';
 import FarmerOnboardingModal from '../components/FarmerOnboardingModal';
+import {
+  NotificationCenterModal,
+  NotificationToastBanner,
+  type NotificationNavigationParamList,
+} from '../components/NotificationCenterModal';
 
 // Screens
 import WelcomeAuthScreen from '../screens/WelcomeAuthScreen';
@@ -125,18 +133,38 @@ function BottomTabNavigator() {
  *   - AgrometWeatherScreen (stack navigates into it from Home)
  */
 export default function RootNavigator() {
-  const { isAuthenticated, isGuest, syncNow } = useAppStore();
+  const navigationRef =
+    useNavigationContainerRef<NotificationNavigationParamList>();
+  const { isAuthenticated, isGuest, hasHydrated, syncNow } = useAppStore();
   const hasAccess = isAuthenticated || isGuest;
 
-  // App launch / login: push any locally cached farmer, questions, bookmarks
-  // and scheme check into all four Supabase tables in the background.
+  // App launch / login: as soon as AsyncStorage hydration finishes, push any
+  // cached farmer, questions, bookmarks and scheme check to all four tables.
   React.useEffect(() => {
-    if (isAuthenticated && !isGuest) syncNow();
-  }, [isAuthenticated, isGuest, syncNow]);
+    if (!hasHydrated || !isAuthenticated || isGuest) return;
+    void (async () => {
+      await syncNow();
+    })();
+  }, [hasHydrated, isAuthenticated, isGuest, syncNow]);
+
+  // Returning from the background is an equally strong sync trigger.
+  React.useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active') return;
+      const current = useAppStore.getState();
+      if (!current.hasHydrated || !current.isAuthenticated || current.isGuest) return;
+      void (async () => {
+        await useAppStore.getState().syncNow();
+        await useAppStore.getState().refreshNotifications();
+      })();
+    });
+    return () => subscription.remove();
+  }, []);
 
   return (
     <View style={styles.root}>
       <NavigationContainer
+        ref={navigationRef}
         // Global audio guard: any tab switch, push, modal or auth transition
         // stops both expo-speech TTS and Sarvam Bulbul playback.
         onReady={stopSpeaking}
@@ -175,6 +203,10 @@ export default function RootNavigator() {
             </>
           )}
         </Stack.Navigator>
+
+        {/* Global smart alerts: bell badge opens this modal from any screen. */}
+        <NotificationCenterModal navigation={navigationRef} />
+        <NotificationToastBanner navigation={navigationRef} />
       </NavigationContainer>
 
       {/* First-time setup / Edit Profile is global so it appears right after OTP. */}

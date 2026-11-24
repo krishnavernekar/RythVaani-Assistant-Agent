@@ -31,7 +31,13 @@ export function TopHeader({
   onNotificationPress,
 }: TopHeaderProps) {
   const insets = useSafeAreaInsets();
-  const { language, setLanguage, farmer } = useAppStore();
+  const {
+    language,
+    setLanguage,
+    farmer,
+    unreadNotificationCount,
+    setNotificationModalOpen,
+  } = useAppStore();
   const isTelugu = language === 'te';
   const locationText = isTelugu
     ? farmer.mandalTe || farmer.mandal || 'గుంటూరు మండలం'
@@ -89,15 +95,21 @@ export function TopHeader({
               {isTelugu ? 'తె / EN' : 'EN / తె'}
             </Text>
           </TouchableOpacity>
-          {onNotificationPress ? (
-            <TouchableOpacity
-              style={styles.bellBtn}
-              onPress={onNotificationPress}
-              hitSlop={{ top: 12, right: 12, bottom: 12, left: 12 }}
-            >
-              <Text style={styles.bellText}>🔔</Text>
-            </TouchableOpacity>
-          ) : null}
+          <TouchableOpacity
+            style={styles.bellBtn}
+            onPress={onNotificationPress ?? (() => setNotificationModalOpen(true))}
+            hitSlop={{ top: 12, right: 12, bottom: 12, left: 12 }}
+            accessibilityLabel="Open smart alerts"
+          >
+            <Text style={styles.bellText}>🔔</Text>
+            {unreadNotificationCount > 0 ? (
+              <View style={styles.bellBadge}>
+                <Text style={styles.bellBadgeText}>
+                  {unreadNotificationCount > 9 ? '9+' : unreadNotificationCount}
+                </Text>
+              </View>
+            ) : null}
+          </TouchableOpacity>
         </View>
       </View>
     </View>
@@ -161,6 +173,26 @@ const styles = StyleSheet.create({
   },
   bellText: {
     fontSize: 18,
+  },
+  bellBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -5,
+    minWidth: 17,
+    height: 17,
+    borderRadius: 9,
+    backgroundColor: '#DC2626',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+    borderWidth: 1.5,
+    borderColor: '#FFFFFF',
+  },
+  bellBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '900',
+    lineHeight: 12,
   },
   backBtn: {
     width: 32,

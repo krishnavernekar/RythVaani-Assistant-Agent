@@ -12,7 +12,6 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   normalizePhone,
   syncFarmerOnLogin,
-  upsertFarmerProfileToCloud,
   syncSavedItemToCloud,
   insertAiQuestionToCloud,
   deleteAiQuestionFromCloud,
@@ -24,6 +23,14 @@ import {
   type SchemeCheckSnapshot,
   type CloudSyncStatus,
 } from '../services/databaseService';
+import {
+  fetchCloudNotifications,
+  generatePersonalizedNotifications,
+  syncNotificationReadState,
+  syncAllNotificationReadStates,
+  syncFarmerNotificationToCloud,
+  type FarmerNotification,
+} from '../services/notificationService';
 
 export type Language = 'te' | 'en' | 'hi';
 
@@ -45,6 +52,12 @@ export interface FarmerProfile {
   district: string;
   state: string;
   category: 'Pattadar' | 'Tenant';
+  /** Optional explicit ownership label used by notification personalization. */
+  ownership?: string;
+  /** Optional e-Panta verification status used by preference alerts. */
+  epantaStatus?: string;
+  /** Optional language carried on the profile for notification personalization. */
+  preferredLanguage?: Language;
   crops: string[];
   cropsTe: string[];
 }
@@ -146,27 +159,45 @@ interface AppState {
   schemeCheck: SchemeCheckSnapshot;
   setSchemeCheck: (snapshot: SchemeCheckSnapshot) => void;
 
+  // Personalized smart alerts
+  notifications: FarmerNotification[];
+  unreadNotificationCount: number;
+  isNotificationModalOpen: boolean;
+  /** Transient top toast for a new urgent alert or a profile-preference edit. */
+  activeBannerNotification: FarmerNotification | null;
+  refreshNotifications: (showProfileBanner?: boolean) => Promise<void>;
+  markNotificationRead: (id: string) => void;
+  markAllNotificationsRead: () => void;
+  setNotificationModalOpen: (open: boolean) => void;
+  dismissBannerNotification: () => void;
+
   // Cloud sync
+  /** True once AsyncStorage hydration has finished — gates auto-sync on launch. */
+  hasHydrated: boolean;
   cloudSyncStatus: CloudSyncStatus;
   syncNow: () => Promise<void>;
 }
 
-const DEFAULT_FARMER: FarmerProfile = {
-  name: 'Venkata Reddy Garu',
-  nameEn: 'Venkata Reddy Garu',
-  nameTe: 'వెంకట రెడ్డి గారు',
-  phone: '+919848000000',
-  phoneMasked: '+919848000000',
+/**
+ * No identity is populated until a farmer logs in with OTP and completes
+ * onboarding. Guest / logged-out sessions must never inherit sample data.
+ */
+const EMPTY_FARMER: FarmerProfile = {
+  name: '',
+  nameEn: '',
+  nameTe: '',
+  phone: '',
+  phoneMasked: '',
   address: '',
-  acres: 4.5,
+  acres: 0,
   acreageLabel: 'Small/Marginal',
-  mandal: 'Guntur Mandal',
-  mandalTe: 'గుంటూరు మండలం',
-  district: 'Guntur',
-  state: 'Andhra Pradesh',
+  mandal: '',
+  mandalTe: '',
+  district: '',
+  state: '',
   category: 'Pattadar',
-  crops: ['Chilli', 'Paddy'],
-  cropsTe: ['మిర్చి', 'వరి'],
+  crops: [],
+  cropsTe: [],
 };
 
 const DEFAULT_SCHEME_CHECK: SchemeCheckSnapshot = {
@@ -174,6 +205,60 @@ const DEFAULT_SCHEME_CHECK: SchemeCheckSnapshot = {
   checkedDocuments: [],
   eligibleCount: 0,
 };
+
+const makeEmptyFarmer = (): FarmerProfile => ({
+  ...EMPTY_FARMER,
+  crops: [],
+  cropsTe: [],
+});
+
+const LEGACY_PLACEHOLDER_PHONES = new Set(['+919848000000', '+919848054321']);
+const LEGACY_PLACEHOLDER_NAMES = new Set([
+  'Venkata Reddy Garu',
+  'వెంకట రెడ్డి గారు',
+]);
+
+const isLegacyPlaceholderProfile = (profile?: FarmerProfile): boolean =>
+  Boolean(
+    profile &&
+      (LEGACY_PLACEHOLDER_NAMES.has(profile.nameEn ?? '') ||
+        LEGACY_PLACEHOLDER_NAMES.has(profile.name ?? '') ||
+        LEGACY_PLACEHOLDER_NAMES.has(profile.nameTe ?? '') ||
+        LEGACY_PLACEHOLDER_PHONES.has(profile.phone ?? '') ||
+        LEGACY_PLACEHOLDER_PHONES.has(profile.phoneMasked ?? '')),
+  );
+
+const purgePlaceholderCaches = (
+  cache: Record<string, PhoneProfileCache> | undefined,
+): Record<string, PhoneProfileCache> =>
+  Object.fromEntries(
+    Object.entries(cache ?? {}).filter(
+      ([phone, snapshot]) =>
+        !LEGACY_PLACEHOLDER_PHONES.has(phone) &&
+        !isLegacyPlaceholderProfile(snapshot.user),
+    ),
+  );
+
+const isProfileComplete = (profile: FarmerProfile): boolean =>
+  Boolean(
+    profile.nameEn?.trim() || profile.name?.trim() || profile.nameTe?.trim(),
+  );
+
+/** Reset everything tied to a previous farmer when auth context changes. */
+const emptySessionPatch = (): Partial<AppState> => ({
+  farmer: makeEmptyFarmer(),
+  savedItems: [],
+  questionHistory: [],
+  questionsAsked: 0,
+  schemeCheck: DEFAULT_SCHEME_CHECK,
+  needsProfileSetup: false,
+  isProfileSetupOpen: false,
+  notifications: [],
+  unreadNotificationCount: 0,
+  isNotificationModalOpen: false,
+  activeBannerNotification: null,
+  cloudSyncStatus: 'offline',
+});
 
 const MANDAL_TE: Record<string, string> = {
   'Guntur Mandal': 'గుంటూరు మండలం',
@@ -201,8 +286,10 @@ const acreageLabelFor = (acres: number): string => {
 const cropTeFor = (crops: string[]): string[] =>
   crops.map((crop) => CROP_TE[crop] ?? crop);
 
-const activePhone = (profile: FarmerProfile): string =>
-  normalizePhone(profile.phone ?? profile.phoneMasked);
+const activePhone = (profile: FarmerProfile): string => {
+  const raw = profile.phone ?? profile.phoneMasked ?? '';
+  return raw.trim() ? normalizePhone(raw) : '';
+};
 
 const makeCleanProfile = (phone: string): FarmerProfile => {
   const normalized = normalizePhone(phone);
@@ -250,26 +337,32 @@ const buildUpdatedProfile = (
   const acresRaw = details.acres ?? current.acres ?? 0;
   const acres = Number.isFinite(Number(acresRaw)) ? Number(acresRaw) : 0;
   const crops = details.crops ?? current.crops ?? [];
+  const rawPhone = (
+    details.phone ??
+    current.phone ??
+    current.phoneMasked ??
+    ''
+  ).trim();
+  const normalizedPhone = rawPhone ? normalizePhone(rawPhone) : '';
 
   return {
     ...current,
     name: nameEn,
     nameEn,
     nameTe: nameTe || nameEn,
-    phone: normalizePhone(
-      details.phone ?? current.phone ?? current.phoneMasked ?? '',
-    ),
-    phoneMasked: normalizePhone(
-      details.phone ?? current.phone ?? current.phoneMasked ?? '',
-    ),
+    phone: normalizedPhone,
+    phoneMasked: normalizedPhone,
     address,
     acres,
     acreageLabel: acreageLabelFor(acres),
     mandal,
     mandalTe: mandal ? MANDAL_TE[mandal] ?? mandal : '',
-    district: (details.district ?? current.district ?? '').trim() || 'Guntur',
-    state: (details.state ?? current.state ?? '').trim() || 'Andhra Pradesh',
+    district: (details.district ?? current.district ?? '').trim(),
+    state: (details.state ?? current.state ?? '').trim(),
     category: details.category ?? current.category ?? 'Pattadar',
+    ownership: details.ownership ?? current.ownership,
+    epantaStatus: details.epantaStatus ?? current.epantaStatus,
+    preferredLanguage: details.preferredLanguage ?? current.preferredLanguage,
     crops,
     cropsTe: cropTeFor(crops),
   };
@@ -291,10 +384,13 @@ const cacheSnapshot = (state: CacheSource): PhoneProfileCache => ({
 const withCachedPhone = (
   state: CacheSource & Pick<AppState, 'profilesByPhone'>,
   phone: string,
-): Record<string, PhoneProfileCache> => ({
-  ...state.profilesByPhone,
-  [phone]: cacheSnapshot(state),
-});
+): Record<string, PhoneProfileCache> =>
+  phone
+    ? {
+        ...state.profilesByPhone,
+        [phone]: cacheSnapshot(state),
+      }
+    : state.profilesByPhone;
 
 const normalizeSavedItem = (item: SavedItem): SavedItem => ({
   ...item,
@@ -330,16 +426,75 @@ type CloudSnapshotSource = Pick<
   | 'schemeCheck'
 >;
 
-const pushSnapshotToCloud = (state: CloudSnapshotSource): void => {
-  if (!state.isAuthenticated || state.isGuest || !isCloudDbConfigured()) return;
-  syncAllLocalDataToCloud({
-    farmer: state.farmer,
-    language: state.language,
-    savedItems: state.savedItems,
-    questionHistory: state.questionHistory,
-    schemeCheck: state.schemeCheck,
-  }).catch(() => undefined);
+/**
+ * Every cloud write goes through these guards so the Profile status pill
+ * always reflects a real in-flight request instead of a stale "synced" flag.
+ * The counter prevents a fast follow-up write from clearing "syncing" while
+ * an earlier request is still running.
+ */
+let cloudWritesInFlight = 0;
+
+const beginCloudWrite = (): void => {
+  cloudWritesInFlight += 1;
+  useAppStore.setState({ cloudSyncStatus: 'syncing' });
 };
+
+const endCloudWrite = (ok: boolean): void => {
+  cloudWritesInFlight = Math.max(0, cloudWritesInFlight - 1);
+  if (cloudWritesInFlight === 0) {
+    useAppStore.setState({ cloudSyncStatus: ok ? 'synced' : 'offline' });
+  }
+};
+
+/** Fire-and-forget wrapper for a single-table cloud write. */
+const runCloudWrite = (task: Promise<boolean>): void => {
+  beginCloudWrite();
+  task.then(
+    (ok) => endCloudWrite(ok),
+    () => endCloudWrite(false),
+  );
+};
+
+/** Push the entire per-phone snapshot to all four Supabase tables. */
+const pushSnapshotToCloud = (state: CloudSnapshotSource): void => {
+  if (
+    !state.isAuthenticated ||
+    state.isGuest ||
+    !activePhone(state.farmer) ||
+    !isCloudDbConfigured()
+  ) {
+    return;
+  }
+  runCloudWrite(
+    syncAllLocalDataToCloud({
+      farmer: state.farmer,
+      language: state.language,
+      savedItems: state.savedItems,
+      questionHistory: state.questionHistory,
+      schemeCheck: state.schemeCheck,
+    }),
+  );
+};
+
+/* ───────────────────── Smart alert helpers ────────────────────────────── */
+
+/** Avoid a startup banner for alerts that were already unread on disk. */
+let notificationsLoadedOnce = false;
+const seenUrgentNotificationIds = new Set<string>();
+
+/** Notification writes are silent — the Profile pill tracks the 4 sync tables. */
+const runNotificationWrite = (task: Promise<boolean>): void => {
+  void (async () => {
+    try {
+      await task;
+    } catch (error) {
+      console.warn('[Notifications] background write failed:', error);
+    }
+  })();
+};
+
+const countUnread = (notifications: FarmerNotification[]): number =>
+  notifications.reduce((total, item) => total + (item.isRead ? 0 : 1), 0);
 
 export const useAppStore = create<AppState>()(
   persist(
@@ -351,35 +506,72 @@ export const useAppStore = create<AppState>()(
         const loggedIn = state.isAuthenticated && !state.isGuest;
         set({
           language: lang,
+          farmer: { ...state.farmer, preferredLanguage: lang },
           profilesByPhone: loggedIn
             ? withCachedPhone({ ...state, language: lang }, activePhone(state.farmer))
             : state.profilesByPhone,
         });
-        // Remember the choice in Supabase for the next login — guests are
-        // never written to the cloud.
-        if (loggedIn && isCloudDbConfigured()) {
-          upsertFarmerProfileToCloud(state.farmer, lang).catch(() => undefined);
+        // Language is stored on public.farmers — push the whole snapshot so
+        // all four tables stay current. Guests are never written to the cloud.
+        if (loggedIn) {
+          pushSnapshotToCloud(get());
+          void get().refreshNotifications();
         }
       },
 
       // ─── Auth ──────────────────────────────────────────────────────────
       isAuthenticated: false,
       isGuest: false,
-      setIsAuthenticated: (val) =>
-        set({ isAuthenticated: val, isGuest: false }),
-      setIsGuest: (val) => set({ isGuest: val, isAuthenticated: false }),
+      setIsAuthenticated: (val) => {
+        if (!val) {
+          set({
+            isAuthenticated: false,
+            isGuest: false,
+            ...emptySessionPatch(),
+          });
+          return;
+        }
+        set({ isAuthenticated: true, isGuest: false });
+      },
+      setIsGuest: (val) => {
+        if (val) {
+          // Guest mode is a clean slate — no previous farmer may leak through.
+          set({
+            isGuest: true,
+            isAuthenticated: false,
+            ...emptySessionPatch(),
+          });
+          return;
+        }
+        set({ isGuest: false });
+      },
 
       login: async (rawPhone: string) => {
         const normalized = normalizePhone(rawPhone);
-        const cached = get().profilesByPhone[normalized];
+        const cachedSnapshot = get().profilesByPhone[normalized];
+        // Never restore a stale cache that belongs to a different/placeholder
+        // farmer, even if it was stored under this phone number.
+        const cached =
+          cachedSnapshot &&
+          !isLegacyPlaceholderProfile(cachedSnapshot.user) &&
+          activePhone(cachedSnapshot.user) === normalized
+            ? cachedSnapshot
+            : undefined;
 
         set({
           isAuthenticated: true,
           isGuest: false,
           cloudSyncStatus: 'syncing',
+          // Alerts are personalized per phone — never carry the previous
+          // farmer's notifications into a new login.
+          notifications: [],
+          unreadNotificationCount: 0,
+          isNotificationModalOpen: false,
+          activeBannerNotification: null,
         });
 
         const restoreCached = (snapshot: PhoneProfileCache) => {
+          const needsSetup = !isProfileComplete(snapshot.user);
           set({
             farmer: snapshot.user,
             language: snapshot.language,
@@ -387,8 +579,8 @@ export const useAppStore = create<AppState>()(
             questionHistory: snapshot.questionHistory,
             questionsAsked: snapshot.questionHistory.length,
             schemeCheck: snapshot.schemeCheck ?? DEFAULT_SCHEME_CHECK,
-            needsProfileSetup: false,
-            isProfileSetupOpen: false,
+            needsProfileSetup: needsSetup,
+            isProfileSetupOpen: needsSetup,
             cloudSyncStatus: isCloudDbConfigured() ? 'synced' : 'offline',
             profilesByPhone: {
               ...get().profilesByPhone,
@@ -396,6 +588,7 @@ export const useAppStore = create<AppState>()(
             },
           });
           pushSnapshotToCloud(get());
+          void get().refreshNotifications();
         };
 
         const startNewPhone = () => {
@@ -421,12 +614,14 @@ export const useAppStore = create<AppState>()(
               },
             },
           });
+          void get().refreshNotifications();
         };
 
         try {
           const result = await syncFarmerOnLogin(normalized);
 
           if (result.isExistingUser) {
+            const needsSetup = !isProfileComplete(result.profile);
             const snapshot: PhoneProfileCache = {
               user: result.profile,
               language: result.preferredLanguage,
@@ -441,8 +636,8 @@ export const useAppStore = create<AppState>()(
               questionHistory: result.questionHistory,
               questionsAsked: result.questionHistory.length,
               schemeCheck: snapshot.schemeCheck,
-              needsProfileSetup: false,
-              isProfileSetupOpen: false,
+              needsProfileSetup: needsSetup,
+              isProfileSetupOpen: needsSetup,
               cloudSyncStatus: 'synced',
               profilesByPhone: {
                 ...get().profilesByPhone,
@@ -450,6 +645,7 @@ export const useAppStore = create<AppState>()(
               },
             });
             pushSnapshotToCloud(get());
+            void get().refreshNotifications();
             return;
           }
 
@@ -468,23 +664,28 @@ export const useAppStore = create<AppState>()(
       },
 
       // ─── Farmer Profile ────────────────────────────────────────────────
-      farmer: DEFAULT_FARMER,
+      farmer: makeEmptyFarmer(),
       setFarmer: (farmer) => {
+        const rawPhone = farmer.phone ?? farmer.phoneMasked ?? '';
+        const phone = rawPhone.trim() ? activePhone(farmer) : '';
         const normalizedFarmer: FarmerProfile = {
           ...farmer,
           nameEn: farmer.nameEn ?? farmer.name,
-          phone: activePhone(farmer),
-          phoneMasked: activePhone(farmer),
+          nameTe: farmer.nameTe || farmer.nameEn || farmer.name || '',
+          phone,
+          phoneMasked: phone,
         };
         const state = get();
         set({
           farmer: normalizedFarmer,
           profilesByPhone: withCachedPhone(
             { ...state, farmer: normalizedFarmer },
-            activePhone(normalizedFarmer),
+            phone,
           ),
         });
-        pushSnapshotToCloud(get());
+        if (phone && state.isAuthenticated && !state.isGuest) {
+          pushSnapshotToCloud(get());
+        }
       },
 
       updateUserProfile: (details) => {
@@ -502,6 +703,7 @@ export const useAppStore = create<AppState>()(
           ),
         });
         pushSnapshotToCloud(get());
+        void get().refreshNotifications(true);
       },
 
       // ─── Profile setup modal ───────────────────────────────────────────
@@ -524,6 +726,7 @@ export const useAppStore = create<AppState>()(
           ),
         });
         pushSnapshotToCloud(get());
+        void get().refreshNotifications(true);
       },
 
       // ─── Per-phone offline cache ───────────────────────────────────────
@@ -543,13 +746,15 @@ export const useAppStore = create<AppState>()(
           ),
         });
         if (isCloudDbConfigured() && state.isAuthenticated && !state.isGuest) {
-          syncSavedItemToCloud(
-            activePhone(state.farmer),
-            item,
-            'UPSERT',
-            state.farmer,
-            state.language,
-          ).catch(() => undefined);
+          runCloudWrite(
+            syncSavedItemToCloud(
+              activePhone(state.farmer),
+              item,
+              'UPSERT',
+              state.farmer,
+              state.language,
+            ),
+          );
         }
       },
       removeSavedItem: (id) => {
@@ -569,13 +774,15 @@ export const useAppStore = create<AppState>()(
           state.isAuthenticated &&
           !state.isGuest
         ) {
-          syncSavedItemToCloud(
-            activePhone(state.farmer),
-            removed,
-            'DELETE',
-            state.farmer,
-            state.language,
-          ).catch(() => undefined);
+          runCloudWrite(
+            syncSavedItemToCloud(
+              activePhone(state.farmer),
+              removed,
+              'DELETE',
+              state.farmer,
+              state.language,
+            ),
+          );
         }
       },
       toggleSavedItem: (rawItem) => {
@@ -593,13 +800,15 @@ export const useAppStore = create<AppState>()(
           ),
         });
         if (isCloudDbConfigured() && state.isAuthenticated && !state.isGuest) {
-          syncSavedItemToCloud(
-            activePhone(state.farmer),
-            item,
-            exists ? 'DELETE' : 'UPSERT',
-            state.farmer,
-            state.language,
-          ).catch(() => undefined);
+          runCloudWrite(
+            syncSavedItemToCloud(
+              activePhone(state.farmer),
+              item,
+              exists ? 'DELETE' : 'UPSERT',
+              state.farmer,
+              state.language,
+            ),
+          );
         }
       },
 
@@ -621,12 +830,14 @@ export const useAppStore = create<AppState>()(
           ),
         });
         if (isCloudDbConfigured() && state.isAuthenticated && !state.isGuest) {
-          insertAiQuestionToCloud(
-            activePhone(state.farmer),
-            question,
-            state.farmer,
-            state.language,
-          ).catch(() => undefined);
+          runCloudWrite(
+            insertAiQuestionToCloud(
+              activePhone(state.farmer),
+              question,
+              state.farmer,
+              state.language,
+            ),
+          );
         }
       },
       removeQuestion: (id) => {
@@ -644,8 +855,8 @@ export const useAppStore = create<AppState>()(
           ),
         });
         if (isCloudDbConfigured() && state.isAuthenticated && !state.isGuest) {
-          deleteAiQuestionFromCloud(activePhone(state.farmer), id).catch(
-            () => undefined,
+          runCloudWrite(
+            deleteAiQuestionFromCloud(activePhone(state.farmer), id),
           );
         }
       },
@@ -662,27 +873,144 @@ export const useAppStore = create<AppState>()(
           ),
         });
         if (isCloudDbConfigured() && state.isAuthenticated && !state.isGuest) {
-          upsertSchemeCheckToCloud(
-            activePhone(state.farmer),
-            snapshot.wizardInputs,
-            snapshot.checkedDocuments,
-            snapshot.eligibleCount,
-            state.farmer,
-            state.language,
-          ).catch(() => undefined);
+          runCloudWrite(
+            upsertSchemeCheckToCloud(
+              activePhone(state.farmer),
+              snapshot.wizardInputs,
+              snapshot.checkedDocuments,
+              snapshot.eligibleCount,
+              state.farmer,
+              state.language,
+            ),
+          );
         }
       },
 
+      // ─── Personalized Smart Alerts ─────────────────────────────────────
+      notifications: [],
+      unreadNotificationCount: 0,
+      isNotificationModalOpen: false,
+      activeBannerNotification: null,
+
+      refreshNotifications: async (showProfileBanner = false) => {
+        const state = get();
+        if (
+          !state.isAuthenticated ||
+          state.isGuest ||
+          !activePhone(state.farmer)
+        ) {
+          return;
+        }
+        const farmer = state.farmer;
+        const localReadById = new Map(
+          state.notifications.map((item) => [item.id, item.isRead]),
+        );
+
+        try {
+          const cloud = await fetchCloudNotifications(farmer);
+          const personalized = generatePersonalizedNotifications(farmer, cloud);
+          const cloudIds = new Set(cloud.map((item) => item.id));
+          const notifications = personalized.map((item) => {
+            const stillRead = localReadById.get(item.id) === true;
+            const merged = { ...item, isRead: item.isRead || stillRead };
+            // Persist a custom/generated alert the first time it appears.
+            if (merged.id.includes('_local_') && !cloudIds.has(merged.id)) {
+              runNotificationWrite(syncFarmerNotificationToCloud(farmer, merged));
+            }
+            return merged;
+          });
+
+          const unreadUrgent = notifications.filter(
+            (item) =>
+              !item.isRead &&
+              item.priority === 'URGENT' &&
+              item.category === 'SCHEME',
+          );
+          let banner: FarmerNotification | null = null;
+          if (showProfileBanner) {
+            banner =
+              notifications.find((item) => item.category === 'PROFILE_ALERT') ??
+              notifications[0] ??
+              null;
+          } else if (notificationsLoadedOnce) {
+            banner =
+              unreadUrgent.find(
+                (item) => !seenUrgentNotificationIds.has(item.id),
+              ) ?? null;
+          }
+          for (const item of unreadUrgent) {
+            seenUrgentNotificationIds.add(item.id);
+          }
+          notificationsLoadedOnce = true;
+
+          set({
+            notifications,
+            unreadNotificationCount: countUnread(notifications),
+            activeBannerNotification:
+              banner ?? get().activeBannerNotification,
+          });
+        } catch (error) {
+          console.warn('[Notifications] refresh failed:', error);
+        }
+      },
+
+      markNotificationRead: (id) => {
+        const state = get();
+        const target = state.notifications.find((item) => item.id === id);
+        if (!target || target.isRead) return;
+        const notifications = state.notifications.map((item) =>
+          item.id === id ? { ...item, isRead: true } : item,
+        );
+        set({
+          notifications,
+          unreadNotificationCount: countUnread(notifications),
+          activeBannerNotification:
+            state.activeBannerNotification?.id === id
+              ? null
+              : state.activeBannerNotification,
+        });
+        if (state.isAuthenticated && !state.isGuest) {
+          runNotificationWrite(
+            syncNotificationReadState(state.farmer, { ...target, isRead: true }, true),
+          );
+        }
+      },
+
+      markAllNotificationsRead: () => {
+        const state = get();
+        const notifications = state.notifications.map((item) => ({
+          ...item,
+          isRead: true,
+        }));
+        set({
+          notifications,
+          unreadNotificationCount: 0,
+          activeBannerNotification: null,
+        });
+        if (state.isAuthenticated && !state.isGuest) {
+          runNotificationWrite(
+            syncAllNotificationReadStates(state.farmer, state.notifications),
+          );
+        }
+      },
+
+      setNotificationModalOpen: (open) =>
+        set({ isNotificationModalOpen: open }),
+
+      dismissBannerNotification: () =>
+        set({ activeBannerNotification: null }),
+
       // ─── Cloud Sync ────────────────────────────────────────────────────
+      hasHydrated: false,
       cloudSyncStatus: isCloudDbConfigured() ? 'synced' : 'offline',
       syncNow: async () => {
-        set({ cloudSyncStatus: 'syncing' });
+        const state = get();
+        if (!isCloudDbConfigured() || !activePhone(state.farmer)) {
+          set({ cloudSyncStatus: 'offline' });
+          return;
+        }
+        beginCloudWrite();
         try {
-          if (!isCloudDbConfigured()) {
-            set({ cloudSyncStatus: 'offline' });
-            return;
-          }
-          const state = get();
           const ok = await syncAllLocalDataToCloud({
             farmer: state.farmer,
             language: state.language,
@@ -690,15 +1018,71 @@ export const useAppStore = create<AppState>()(
             questionHistory: state.questionHistory,
             schemeCheck: state.schemeCheck,
           });
-          set({ cloudSyncStatus: ok ? 'synced' : 'offline' });
+          endCloudWrite(ok);
         } catch {
-          set({ cloudSyncStatus: 'offline' });
+          endCloudWrite(false);
         }
       },
     }),
     {
       name: 'rythuvaani-app-state',
       storage: createJSONStorage(() => AsyncStorage),
+      onRehydrateStorage: () => (_state, error) => {
+        if (error) console.warn('[DB] AsyncStorage hydration failed:', error);
+        const persisted = useAppStore.getState();
+        const hasSession = Boolean(
+          persisted.isAuthenticated && !persisted.isGuest,
+        );
+        const hasLegacyPlaceholder =
+          isLegacyPlaceholderProfile(persisted.farmer) ||
+          Object.values(persisted.profilesByPhone ?? {}).some((snapshot) =>
+            isLegacyPlaceholderProfile(snapshot.user),
+          );
+
+        const patch: Partial<AppState> = {
+          hasHydrated: true,
+          unreadNotificationCount: (persisted.notifications ?? []).reduce(
+            (total, item) => total + (item.isRead ? 0 : 1),
+            0,
+          ),
+        };
+
+        if (!hasSession || hasLegacyPlaceholder) {
+          Object.assign(patch, emptySessionPatch());
+          patch.profilesByPhone = purgePlaceholderCaches(
+            persisted.profilesByPhone,
+          );
+          if (hasSession && hasLegacyPlaceholder) {
+            // Stale sample profile: force a fresh OTP login instead of
+            // trusting any data restored from the old persisted state.
+            patch.isAuthenticated = false;
+            patch.isGuest = false;
+          }
+        } else if (!isProfileComplete(persisted.farmer)) {
+          // Cloud auto-sync may have created a phone-only row. Ask for real
+          // details rather than showing an empty or inherited profile.
+          patch.needsProfileSetup = true;
+          patch.isProfileSetupOpen = true;
+        }
+
+        useAppStore.setState(patch);
+
+        // The very first background sync + alert refresh happens here the
+        // instant persisted per-phone data is available — no button, no focus.
+        const current = useAppStore.getState();
+        if (
+          current.isAuthenticated &&
+          !current.isGuest &&
+          activePhone(current.farmer)
+        ) {
+          setTimeout(() => {
+            void (async () => {
+              await useAppStore.getState().syncNow();
+              await useAppStore.getState().refreshNotifications();
+            })();
+          }, 0);
+        }
+      },
       partialize: (state) => ({
         language: state.language,
         isAuthenticated: state.isAuthenticated,
@@ -710,6 +1094,7 @@ export const useAppStore = create<AppState>()(
         schemeCheck: state.schemeCheck,
         needsProfileSetup: state.needsProfileSetup,
         profilesByPhone: state.profilesByPhone,
+        notifications: state.notifications,
       }),
     },
   ),
